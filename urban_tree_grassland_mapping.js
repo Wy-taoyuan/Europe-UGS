@@ -1,41 +1,32 @@
 /********************* 用户配置区 *********************/
 var MANUAL_SHP_ASSET = '';
-var ALL_CITIES_ASSET = 'projects/earthengine-legacy/assets/users/wangwenna111/Europe_allcity_Merged_Finall2';
+var DRIVE_FOLDER = 'GEE_Unmix';
 
-// 导出文件夹
-var EXPORT_FOLDER = 'GEE_Unmix';
-
-// 默认年份（UI 会覆盖）
 var YEAR = 2024;
 var MONTHS = [1, 12];
 var CLOUD_PCT = 20;
 var SCALE = 10;
 
-// 自动纯样本数量
-var N_TREE  = 500;
-var N_GRASS = 500;
-var N_IMP   = 500;
-var N_SOIL  = 500;
-var N_WATER = 200;   
+var N_TREE = 400;
+var N_GRASS = 400;
+var N_IMPERV = 400;
+var N_SOIL = 400;
 var ERODE_PIX = 3;
 
-// Fisher 相关
-var FISHER_BANDS = ['B2','B3','B4','B8','B11','B12'];
-var FSR_ALPHA = 0.3;   // FSR = 0.3 * sigma(EDA)
-var KNN_K = 5;
-var REPEAT_SCALE = 20;
-var TRAIN_BUF = 10000;
+var UNMIX_BANDS = ['B2', 'B3', 'B4', 'B8', 'B11', 'B12'];
+var LAMBDA = 1e-3;
 
-// 基础特征
-var S2_BANDS_ALL = [
-  'B2','B3','B4','B5','B6','B7','B8','B8A','B11','B12',
-  'NDVI','EVI','GCI','SAVI','NDBI','NDWI'
-];
+var KNN_K = 60;
+var FSR_PCTL = 85;
+
+var TRAIN_BUF = 10000;
 var KEY_BAND = 'B4_mean';
 
+var ALL_CITIES_ASSET = '';
+var allCitiesFC = ee.FeatureCollection(ALL_CITIES_ASSET);
 
-/********************* 通用工具 *********************/
-function s2Collection(region, year, months){
+/********************* 通用小工具 *********************/
+function s2Collection(region, year, months) {
   var t0 = ee.Date.fromYMD(year, months[0], 1);
   var t1 = ee.Date.fromYMD(year, months[1], 1).advance(1, 'month');
   return ee.ImageCollection('COPERNICUS/S2_SR')
@@ -44,8 +35,8 @@ function s2Collection(region, year, months){
     .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', CLOUD_PCT));
 }
 
-function addIndices(img){
-  var ndvi = img.normalizedDifference(['B8','B4']).rename('NDVI');
+function addIndices(img) {
+  var ndvi = img.normalizedDifference(['B8', 'B4']).rename('NDVI');
   var evi = img.expression(
     '2.5*((NIR-RED)/(NIR+6*RED-7.5*BLUE+1))',
     {NIR: img.select('B8'), RED: img.select('B4'), BLUE: img.select('B2')}
@@ -54,18 +45,18 @@ function addIndices(img){
     NIR: img.select('B8'),
     GREEN: img.select('B3')
   }).rename('GCI');
-  var savi = img.expression(
-    '((NIR-RED)/(NIR+RED+0.5))*1.5',
-    {NIR: img.select('B8'), RED: img.select('B4')}
-  ).rename('SAVI');
-  var ndbi = img.normalizedDifference(['B11','B8']).rename('NDBI');
-  var ndwi = img.normalizedDifference(['B3','B8']).rename('NDWI');
+  var savi = img.expression('((NIR-RED)/(NIR+RED+0.5))*1.5', {
+    NIR: img.select('B8'),
+    RED: img.select('B4')
+  }).rename('SAVI');
+  var ndbi = img.normalizedDifference(['B11', 'B8']).rename('NDBI');
+  var ndwi = img.normalizedDifference(['B3', 'B8']).rename('NDWI');
 
   var base = img.select(['B2','B3','B4','B5','B6','B7','B8','B8A','B11','B12']);
   return base.addBands([ndvi, evi, gci, savi, ndbi, ndwi]);
 }
 
-function maskCount(img, region, scale){
+function maskCount(img, region, scale) {
   var d = ee.Dictionary(
     img.mask().reduceRegion({
       reducer: ee.Reducer.sum(),
@@ -80,10 +71,8 @@ function maskCount(img, region, scale){
   return ee.Number(ee.Algorithms.If(hasVal, vals.get(0), 0));
 }
 
-function stratifiedPointsSafe(seedImg, classValue, nPerClass, region, labelName){
+function stratifiedPointsSafe(seedImg, classValue, nPerClass, region) {
   var cnt = maskCount(seedImg, region, SCALE);
-  print('候选像元数量 - ' + labelName + ':', cnt);
-
   return ee.FeatureCollection(ee.Algorithms.If(
     cnt.gt(0),
     seedImg.updateMask(seedImg).rename('class').multiply(classValue).toInt()
@@ -101,7 +90,7 @@ function stratifiedPointsSafe(seedImg, classValue, nPerClass, region, labelName)
   ));
 }
 
-function tryLoadManualSamples(path){
+function tryLoadManualSamples(path) {
   if (!path || path === '') return {has: false, fc: ee.FeatureCollection([])};
   var has = false;
   var fc = ee.FeatureCollection([]);
@@ -110,373 +99,340 @@ function tryLoadManualSamples(path){
     var c = fc.limit(1).size().getInfo();
     has = (c >= 0);
   } catch (err) {
-    print('⚠️ 手动样本资产不可用/不存在：', path);
     has = false;
     fc = ee.FeatureCollection([]);
   }
   return {has: has, fc: fc};
 }
 
-function imageMeanDict(img, bands, region){
-  return ee.Dictionary(img.select(bands).reduceRegion({
-    reducer: ee.Reducer.mean(),
-    geometry: region,
-    scale: SCALE,
-    maxPixels: 1e12,
-    bestEffort: true
-  }));
-}
+function ensureRF3OneHot(fc) {
+  return ee.FeatureCollection(fc).map(function(f) {
+    var hasTree = f.get('TreeRatio');
+    var hasGrass = f.get('GrassRatio');
+    var hasOther = f.get('OtherRatio');
 
-function zeroVector(n){
-  return ee.Array(ee.List.repeat(0, n));
-}
+    var needFill = ee.Algorithms.If(
+      ee.Algorithms.IsEqual(hasTree, null),
+      true,
+      ee.Algorithms.If(
+        ee.Algorithms.IsEqual(hasGrass, null),
+        true,
+        ee.Algorithms.IsEqual(hasOther, null)
+      )
+    );
 
-function zeroMatrix(n){
-  var rows = ee.List.sequence(1, n).map(function(_){
-    return ee.List.repeat(0, n);
-  });
-  return ee.Array(rows);
-}
+    var c = ee.Number(ee.Algorithms.If(f.get('class'), f.get('class'), -999));
 
-function identityMatrix(n){
-  return ee.Array.identity(n);
-}
-
-function ensureTGISLabels(fc, cityName){
-  return ee.FeatureCollection(fc).map(function(f){
-    var cls = ee.Number(ee.Algorithms.If(
-      ee.Algorithms.IsEqual(f.get('class'), null), -999, f.get('class')
+    var lab = ee.Dictionary(ee.Algorithms.If(
+      needFill,
+      ee.Algorithms.If(
+        c.eq(1), ee.Dictionary({'TreeRatio':1,'GrassRatio':0,'OtherRatio':0}),
+        ee.Algorithms.If(
+          c.eq(2), ee.Dictionary({'TreeRatio':0,'GrassRatio':1,'OtherRatio':0}),
+          ee.Algorithms.If(
+            c.eq(3), ee.Dictionary({'TreeRatio':0,'GrassRatio':0,'OtherRatio':1}),
+            ee.Dictionary({'TreeRatio':0,'GrassRatio':0,'OtherRatio':0})
+          )
+        )
+      ),
+      ee.Dictionary({})
     ));
 
-    var t = ee.Number(ee.Algorithms.If(
-      ee.Algorithms.IsEqual(f.get('TreeRatio'), null),
-      ee.Algorithms.If(cls.eq(1), 1, 0),
-      f.get('TreeRatio')
-    ));
-
-    var g = ee.Number(ee.Algorithms.If(
-      ee.Algorithms.IsEqual(f.get('GrassRatio'), null),
-      ee.Algorithms.If(cls.eq(2), 1, 0),
-      f.get('GrassRatio')
-    ));
-
-    var i = ee.Number(ee.Algorithms.If(
-      ee.Algorithms.IsEqual(f.get('ImpRatio'), null),
-      ee.Algorithms.If(cls.eq(3), 1, 0),
-      f.get('ImpRatio')
-    ));
-
-    var s = ee.Number(ee.Algorithms.If(
-      ee.Algorithms.IsEqual(f.get('SoilRatio'), null),
-      ee.Algorithms.If(cls.eq(4), 1, 0),
-      f.get('SoilRatio')
-    ));
-
-    var sm = t.add(g).add(i).add(s);
-
-    var tn = ee.Number(ee.Algorithms.If(sm.gt(0), t.divide(sm), 0));
-    var gn = ee.Number(ee.Algorithms.If(sm.gt(0), g.divide(sm), 0));
-    var inb = ee.Number(ee.Algorithms.If(sm.gt(0), i.divide(sm), 0));
-    var sn = ee.Number(ee.Algorithms.If(sm.gt(0), s.divide(sm), 0));
-
-    return f.set({
-      TreeRatio: tn,
-      GrassRatio: gn,
-      ImpRatio: inb,
-      SoilRatio: sn,
-      city: cityName
-    });
-  });
+    return f.set(lab);
+  }).filter(
+    ee.Filter.or(
+      ee.Filter.eq('TreeRatio', 1),
+      ee.Filter.or(
+        ee.Filter.eq('GrassRatio', 1),
+        ee.Filter.eq('OtherRatio', 1)
+      )
+    )
+  );
 }
 
-function setTGISClassFromRatios(fc){
-  return ee.FeatureCollection(fc).map(function(f){
-    var t = ee.Number(f.get('TreeRatio'));
-    var g = ee.Number(f.get('GrassRatio'));
-    var i = ee.Number(f.get('ImpRatio'));
-    var s = ee.Number(f.get('SoilRatio'));
-
-    var arr = ee.List([t, g, i, s]);
-    var mx = ee.Number(arr.reduce(ee.Reducer.max()));
-    var idx = ee.Number(arr.indexOf(mx)).add(1); // 1..4
-    return f.set('tgis', idx);
-  });
-}
-
-function seedsFromWorldCoverTGIS(region){
+/********************* TGIS *********************/
+function seedsFromWorldCoverTGIS(region) {
   var wc = ee.Image('ESA/WorldCover/v200/2021').select('Map').clip(region);
   var s2Med = s2Collection(region, YEAR, MONTHS).map(addIndices).median();
 
   var ndvi = s2Med.select('NDVI');
   var ndwi = s2Med.select('NDWI');
-  var ndbi = s2Med.select('NDBI');
 
-  var tree  = wc.eq(10);  // Tree cover
-  var grass = wc.eq(30);  // Grassland
-  var imp   = wc.eq(50);  // Built-up
-  var soil  = wc.eq(60);  // Bare / sparse vegetation
-  var water = wc.eq(80);  // Water
+  var dw = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1')
+    .filterBounds(region)
+    .filterDate(
+      ee.Date.fromYMD(YEAR, MONTHS[0], 1),
+      ee.Date.fromYMD(YEAR, MONTHS[1], 1).advance(1, 'month')
+    )
+    .select('label')
+    .mode()
+    .clip(region);
 
-  tree = tree.focal_min({radius: ERODE_PIX, units:'pixels'})
-    .updateMask(ndvi.gte(0.55).and(ndwi.lt(0.15)));
+  var built = dw.eq(6);
+  var bare = dw.eq(7);
+  var water = wc.eq(80).or(ndwi.gte(0.3));
 
-  grass = grass.focal_min({radius: ERODE_PIX, units:'pixels'})
-    .updateMask(ndvi.gte(0.30).and(ndvi.lt(0.65)).and(ndwi.lt(0.15)));
+  var tree = wc.eq(10)
+    .focal_min({radius: ERODE_PIX, units: 'pixels'})
+    .updateMask(ndvi.gte(0.55))
+    .updateMask(water.not());
 
-  imp = imp.focal_min({radius: ERODE_PIX, units:'pixels'})
-    .updateMask(ndvi.lt(0.20).and(ndwi.lt(0.10)).and(ndbi.gt(0)));
+  var grass = wc.eq(30)
+    .focal_min({radius: ERODE_PIX, units: 'pixels'})
+    .updateMask(ndvi.gte(0.25).and(ndvi.lt(0.75)))
+    .updateMask(water.not());
 
-  soil = soil.focal_min({radius: ERODE_PIX, units:'pixels'})
-    .updateMask(ndvi.lt(0.25).and(ndwi.lt(0.10)).and(ndbi.lt(0.20)));
+  var imperv = wc.eq(50).or(built)
+    .focal_min({radius: ERODE_PIX, units: 'pixels'})
+    .updateMask(ndvi.lt(0.25))
+    .updateMask(ndwi.lt(0.15));
 
-  water = water.focal_min({radius: 1, units:'pixels'})
-    .updateMask(ndwi.gt(0.30));
+  var soil = wc.eq(60).or(bare)
+    .focal_min({radius: ERODE_PIX, units: 'pixels'})
+    .updateMask(ndvi.lt(0.20))
+    .updateMask(ndwi.lt(0.15))
+    .updateMask(imperv.not())
+    .updateMask(water.not());
 
   return {
     tree: tree.selfMask(),
     grass: grass.selfMask(),
-    imp: imp.selfMask(),
-    soil: soil.selfMask(),
-    water: water.selfMask()
+    imperv: imperv.selfMask(),
+    soil: soil.selfMask()
   };
 }
 
+function buildAutoSamplesTGIS(region, cityName) {
+  var seeds = seedsFromWorldCoverTGIS(region);
 
-/********************* Fisher 变换 *********************/
-function fisherFitFromSamples(sampleFC, bandList, classProp, classValues, fallbackImg, fallbackRegion){
-  bandList = ee.List(bandList);
-  classValues = ee.List(classValues);
+  var treePts = stratifiedPointsSafe(seeds.tree, 1, N_TREE, region);
+  var grassPts = stratifiedPointsSafe(seeds.grass, 2, N_GRASS, region);
+  var impervPts = stratifiedPointsSafe(seeds.imperv, 3, N_IMPERV, region);
+  var soilPts = stratifiedPointsSafe(seeds.soil, 4, N_SOIL, region);
 
-  var nb = ee.Number(bandList.size());
-  var fallbackDict = imageMeanDict(fallbackImg, bandList, fallbackRegion);
+  var auto4 = ee.FeatureCollection(treePts)
+    .merge(grassPts)
+    .merge(impervPts)
+    .merge(soilPts)
+    .map(function(f) {
+      var c = ee.Number(f.get('class'));
 
-  var classStats = classValues.map(function(cv){
-    cv = ee.Number(cv);
-    var sub = sampleFC.filter(ee.Filter.eq(classProp, cv));
-    var n = ee.Number(sub.size());
-
-    var meanArr = ee.Array(ee.List(bandList).map(function(b){
-      b = ee.String(b);
-      return ee.Number(ee.Algorithms.If(
-        n.gt(0),
-        sub.aggregate_mean(b),
-        ee.Number(ee.Algorithms.If(fallbackDict.contains(b), fallbackDict.get(b), 0))
+      var tgis = ee.Dictionary(ee.Algorithms.If(
+        c.eq(1), ee.Dictionary({'TreeRatio':1,'GrassRatio':0,'ImpervRatio':0,'SoilRatio':0}),
+        ee.Algorithms.If(
+          c.eq(2), ee.Dictionary({'TreeRatio':0,'GrassRatio':1,'ImpervRatio':0,'SoilRatio':0}),
+          ee.Algorithms.If(
+            c.eq(3), ee.Dictionary({'TreeRatio':0,'GrassRatio':0,'ImpervRatio':1,'SoilRatio':0}),
+            ee.Dictionary({'TreeRatio':0,'GrassRatio':0,'ImpervRatio':0,'SoilRatio':1})
+          )
+        )
       ));
+
+      var tgo = ee.Dictionary(ee.Algorithms.If(
+        c.eq(1), ee.Dictionary({'RF_TreeRatio':1,'RF_GrassRatio':0,'RF_OtherRatio':0}),
+        ee.Algorithms.If(
+          c.eq(2), ee.Dictionary({'RF_TreeRatio':0,'RF_GrassRatio':1,'RF_OtherRatio':0}),
+          ee.Dictionary({'RF_TreeRatio':0,'RF_GrassRatio':0,'RF_OtherRatio':1})
+        )
+      ));
+
+      return f.set(tgis).set(tgo).set({'city': cityName});
+    })
+    .distinct(['.geo']);
+
+  return auto4;
+}
+
+/********************* Fisher-transformed LSMA 工具函数 *********************/
+function listToColArray(list) {
+  list = ee.List(list);
+  return ee.Array(list.map(function(v) { return [v]; }));
+}
+
+function meanVectorFC(fc, bandList, fallbackImg, fbGeom) {
+  fc = ee.FeatureCollection(fc);
+  bandList = ee.List(bandList);
+  var count = fc.size();
+
+  var vals = bandList.map(function(b) {
+    b = ee.String(b);
+    return ee.Algorithms.If(
+      count.gt(0),
+      fc.aggregate_mean(b),
+      fallbackImg.select([b]).reduceRegion({
+        reducer: ee.Reducer.mean(),
+        geometry: fbGeom,
+        scale: 10,
+        maxPixels: 1e10,
+        bestEffort: true
+      }).get(b)
+    );
+  });
+  return listToColArray(vals);
+}
+
+function safeCov(fc, bandList) {
+  fc = ee.FeatureCollection(fc);
+  bandList = ee.List(bandList);
+
+  var n = ee.Number(fc.size());
+  var p = bandList.size();
+  var eye = ee.Array.identity(p);
+
+  return ee.Array(ee.Algorithms.If(
+    n.gt(1),
+    ee.Array(
+      bandList.map(function(bi) {
+        bi = ee.String(bi);
+        var mui = ee.Number(fc.aggregate_mean(bi));
+
+        return bandList.map(function(bj) {
+          bj = ee.String(bj);
+          var muj = ee.Number(fc.aggregate_mean(bj));
+
+          var withCovTerm = fc.map(function(f) {
+            var xi = ee.Number(f.get(bi));
+            var xj = ee.Number(f.get(bj));
+            var term = xi.subtract(mui).multiply(xj.subtract(muj));
+            return f.set('cov_term_tmp', term);
+          });
+
+          var s = ee.Number(withCovTerm.aggregate_sum('cov_term_tmp'));
+          return s.divide(n.subtract(1));
+        });
+      })
+    ),
+    eye.multiply(1e-6)
+  ));
+}
+
+function buildFisherTransform(pureSampledFC, bandList, fallbackImg, fbGeom) {
+  var p = ee.List(bandList).size();
+  var I = ee.Array.identity(p);
+
+  var c0 = pureSampledFC.filter(ee.Filter.eq('cls', 0));
+  var c1 = pureSampledFC.filter(ee.Filter.eq('cls', 1));
+  var c2 = pureSampledFC.filter(ee.Filter.eq('cls', 2));
+  var c3 = pureSampledFC.filter(ee.Filter.eq('cls', 3));
+
+  var n0 = ee.Number(c0.size());
+  var n1 = ee.Number(c1.size());
+  var n2 = ee.Number(c2.size());
+  var n3 = ee.Number(c3.size());
+
+  var mu0 = meanVectorFC(c0, bandList, fallbackImg, fbGeom);
+  var mu1 = meanVectorFC(c1, bandList, fallbackImg, fbGeom);
+  var mu2 = meanVectorFC(c2, bandList, fallbackImg, fbGeom);
+  var mu3 = meanVectorFC(c3, bandList, fallbackImg, fbGeom);
+
+  var Sw = safeCov(c0, bandList).multiply(n0.subtract(1).max(0))
+    .add(safeCov(c1, bandList).multiply(n1.subtract(1).max(0)))
+    .add(safeCov(c2, bandList).multiply(n2.subtract(1).max(0)))
+    .add(safeCov(c3, bandList).multiply(n3.subtract(1).max(0)))
+    .add(I.multiply(LAMBDA));
+
+  var invSw = Sw.matrixInverse();
+
+  var w0 = invSw.matrixMultiply(mu0.subtract(mu3));
+  var w1 = invSw.matrixMultiply(mu1.subtract(mu3));
+  var w2 = invSw.matrixMultiply(mu2.subtract(mu3));
+
+  var W = ee.Array.cat([
+    w0.matrixTranspose(),
+    w1.matrixTranspose(),
+    w2.matrixTranspose()
+  ], 0);
+
+  return W;
+}
+
+function projectImageToFisher(img, W, bandList) {
+  var arr = img.select(bandList).toArray().toArray(1);
+  return ee.Image.constant(W).matrixMultiply(arr)
+    .arrayProject([0])
+    .arrayFlatten([['F1', 'F2', 'F3']]);
+}
+
+function projectFCToFisher(fc, bandList, W) {
+  fc = ee.FeatureCollection(fc);
+  bandList = ee.List(bandList);
+
+  return fc.map(function(f) {
+    var x = listToColArray(bandList.map(function(b) {
+      return f.get(ee.String(b));
     }));
-
-    var covArr = ee.Array(ee.Algorithms.If(
-      n.gt(1),
-      sub.reduceColumns({
-        reducer: ee.Reducer.centeredCovariance(),
-        selectors: bandList
-      }).get('covariance'),
-      identityMatrix(nb).multiply(1e-6)
-    ));
-
-    return ee.Dictionary({
-      classValue: cv,
-      n: n,
-      mean: meanArr,
-      cov: covArr
+    var z = W.matrixMultiply(x);
+    return f.set({
+      F1: z.get([0, 0]),
+      F2: z.get([1, 0]),
+      F3: z.get([2, 0])
     });
   });
-
-  var totalN = ee.Number(classStats.iterate(function(d, acc){
-    d = ee.Dictionary(d);
-    return ee.Number(acc).add(ee.Number(d.get('n')));
-  }, 0)).max(1);
-
-  var globalMean = ee.Array(classStats.iterate(function(d, acc){
-    d = ee.Dictionary(d);
-    acc = ee.Array(acc);
-    var n = ee.Number(d.get('n'));
-    var mu = ee.Array(d.get('mean'));
-    return acc.add(mu.multiply(n));
-  }, zeroVector(nb))).divide(totalN);
-
-  var Sw = ee.Array(classStats.iterate(function(d, acc){
-    d = ee.Dictionary(d);
-    acc = ee.Array(acc);
-    var n = ee.Number(d.get('n'));
-    var cov = ee.Array(d.get('cov'));
-    return acc.add(cov.multiply(n.subtract(1).max(1)));
-  }, zeroMatrix(nb))).add(identityMatrix(nb).multiply(1e-6));
-
-  var Sb = ee.Array(classStats.iterate(function(d, acc){
-    d = ee.Dictionary(d);
-    acc = ee.Array(acc);
-    var n = ee.Number(d.get('n'));
-    var mu = ee.Array(d.get('mean'));
-    var diff = mu.subtract(globalMean).reshape([nb, 1]);
-    return acc.add(diff.matrixMultiply(diff.matrixTranspose()).multiply(n));
-  }, zeroMatrix(nb)));
-
-  var mat = Sw.matrixInverse().matrixMultiply(Sb);
-  var eig = mat.eigen();       // 每行：[eigenValue, eigenVector...]
-  var eigVecs = eig.slice(1, 1);
-  var outDim = ee.Number(classValues.size()).subtract(1); // 5类 -> 4维 Fisher 空间
-
-  // 直接取前 outDim 个特征向量
-  var W = eigVecs.slice(0, 0, outDim);
-
-  return {
-    W: W,
-    outDim: outDim
-  };
 }
 
-function projectImageToFisher(img, bandList, W, outNames){
-  var x = img.select(bandList).toArray().toArray(1); // nb x 1
-  var Wimg = ee.Image.constant(W);                   // d x nb
-  return Wimg.matrixMultiply(x)
-    .arrayProject([0])
-    .arrayFlatten([outNames])
-    .float();
+function projectVectorToFisher(vecCol, W) {
+  return W.matrixMultiply(vecCol);
 }
 
-function sampleFisherAndReflectance(fisherImg, coreImg, fc, props){
-  return fisherImg.addBands(coreImg).sampleRegions({
-    collection: fc,
-    properties: props,
-    scale: SCALE,
-    geometries: true
-  }).filter(ee.Filter.neq(FISHER_BANDS[0], -9999));
+function colArrayToList3(colArr) {
+  return ee.List([
+    colArr.get([0, 0]),
+    colArr.get([1, 0]),
+    colArr.get([2, 0])
+  ]);
 }
 
+function refineEndmemberByKNN_FSR(sampledFC, fallbackVec, bandList, W, fallbackImg, fbGeom) {
+  sampledFC = ee.FeatureCollection(sampledFC);
 
-/********************* 端元提纯：KNN + FSR *********************/
-function classCenterArray(fc, bandList, classProp, classValue, fallbackImg, fallbackRegion){
-  var sub = fc.filter(ee.Filter.eq(classProp, classValue));
-  var n = ee.Number(sub.size());
-  var fbDict = imageMeanDict(fallbackImg, bandList, fallbackRegion);
+  var proj = projectFCToFisher(sampledFC, bandList, W);
 
-  return ee.Array(ee.List(bandList).map(function(b){
-    b = ee.String(b);
-    return ee.Number(ee.Algorithms.If(
-      n.gt(0),
-      sub.aggregate_mean(b),
-      ee.Number(ee.Algorithms.If(fbDict.contains(b), fbDict.get(b), 0))
-    ));
-  }));
-}
+  var cF1 = ee.Number(proj.aggregate_mean('F1'));
+  var cF2 = ee.Number(proj.aggregate_mean('F2'));
+  var cF3 = ee.Number(proj.aggregate_mean('F3'));
 
-function distanceImageToCenter(fisherImg, fisherBands, centerArr){
-  var centerImg = ee.Image.constant(centerArr).rename(fisherBands);
-  var diff2 = fisherImg.select(fisherBands).subtract(centerImg).pow(2);
-  return diff2.reduce(ee.Reducer.sum()).sqrt().rename('fsDist');
-}
+  var withDist = proj.map(function(f) {
+    var d = ee.Number(f.get('F1')).subtract(cF1).pow(2)
+      .add(ee.Number(f.get('F2')).subtract(cF2).pow(2))
+      .add(ee.Number(f.get('F3')).subtract(cF3).pow(2))
+      .sqrt();
+    return f.set('fDist', d);
+  });
 
-function extractEndmemberByKnnAndFSR(fisherImg, coreImg, knnClassImg, classValue, pureTrainFC, fisherBands, region){
-  var center = classCenterArray(pureTrainFC, fisherBands, 'tgis', classValue, fisherImg, region);
-  var dImg = distanceImageToCenter(fisherImg, fisherBands, center);
-  var candidateMask = knnClassImg.eq(classValue);
-
-  var sigmaDict = ee.Dictionary(
-    dImg.updateMask(candidateMask).reduceRegion({
-      reducer: ee.Reducer.stdDev(),
-      geometry: region,
-      scale: SCALE,
-      maxPixels: 1e12,
-      bestEffort: true
-    })
+  var fsr = ee.Number(
+    withDist.reduceColumns(ee.Reducer.percentile([FSR_PCTL]), ['fDist'])
+      .get('p' + FSR_PCTL)
   );
 
-  var sigma = ee.Number(ee.Algorithms.If(
-    sigmaDict.contains('fsDist'),
-    sigmaDict.get('fsDist'),
-    0.05
+  var kept = withDist
+    .filter(ee.Filter.lte('fDist', fsr))
+    .sort('fDist')
+    .limit(KNN_K);
+
+  return ee.Array(ee.Algorithms.If(
+    kept.size().gt(0),
+    meanVectorFC(kept, bandList, fallbackImg, fbGeom),
+    fallbackVec
   ));
-
-  var fsr = sigma.multiply(FSR_ALPHA).max(0.01);
-  var keptMask = candidateMask.and(dImg.lte(fsr));
-
-  var fisherMeanDict = ee.Dictionary(
-    fisherImg.select(fisherBands).updateMask(keptMask).reduceRegion({
-      reducer: ee.Reducer.mean(),
-      geometry: region,
-      scale: SCALE,
-      maxPixels: 1e12,
-      bestEffort: true
-    })
-  );
-
-  var reflMeanDict = ee.Dictionary(
-    coreImg.select(FISHER_BANDS).updateMask(keptMask).reduceRegion({
-      reducer: ee.Reducer.mean(),
-      geometry: region,
-      scale: SCALE,
-      maxPixels: 1e12,
-      bestEffort: true
-    })
-  );
-
-  var fisherFallback = classCenterArray(pureTrainFC, fisherBands, 'tgis', classValue, fisherImg, region);
-  var reflFallback   = classCenterArray(pureTrainFC, FISHER_BANDS, 'tgis', classValue, coreImg, region);
-
-  var fisherMean = ee.Array(ee.List(fisherBands).map(function(b, idx){
-    b = ee.String(b);
-    idx = ee.Number(idx);
-    return ee.Number(ee.Algorithms.If(
-      fisherMeanDict.contains(b),
-      fisherMeanDict.get(b),
-      fisherFallback.get([idx])
-    ));
-  })).reshape([fisherBands.length, 1]);
-
-  var reflMean = ee.Array(ee.List(FISHER_BANDS).map(function(b, idx){
-    b = ee.String(b);
-    idx = ee.Number(idx);
-    return ee.Number(ee.Algorithms.If(
-      reflMeanDict.contains(b),
-      reflMeanDict.get(b),
-      reflFallback.get([idx])
-    ));
-  })).reshape([FISHER_BANDS.length, 1]);
-
-  return {
-    center: center,
-    fsr: fsr,
-    fisher: fisherMean,
-    refl: reflMean,
-    mask: keptMask
-  };
 }
 
-
-/********************* Fisher 空间约束解混 *********************/
-// 用“sum-to-one 增广最小二乘 + 非负裁剪 + 归一化”近似 FCLS
-function fisherConstrainedUnmix(fisherImg, fisherBands, E, outNames){
-  var p = outNames.length;
-
-  var oneRow = ee.Array([ee.List.repeat(1, p)]); // 1 x p
-  var Eaug = ee.Array.cat([E, oneRow], 0);       // (d+1) x p
-
-  var G = Eaug.matrixTranspose()
-    .matrixMultiply(Eaug)
-    .add(identityMatrix(p).multiply(1e-6));
-
-  var pinv = G.matrixInverse().matrixMultiply(Eaug.matrixTranspose());
-
-  var yaug = fisherImg.select(fisherBands)
-    .addBands(ee.Image.constant(1).rename('const1'))
-    .toArray()
-    .toArray(1); // (d+1) x 1
-
-  var f = ee.Image.constant(pinv).matrixMultiply(yaug)
-    .arrayProject([0])
-    .arrayFlatten([outNames]);
-
-  var fPos = f.max(0);
-  var sm = fPos.reduce(ee.Reducer.sum()).rename('sumF');
-
-  return fPos.divide(sm).where(sm.eq(0), 0).float();
+function normAbund4(img4) {
+  var sum = img4.reduce(ee.Reducer.sum()).rename('UMX_sum');
+  var nrm = img4.divide(sum).where(sum.eq(0), 0)
+    .rename(['UMXn_Tree', 'UMXn_Grass', 'UMXn_Imperv', 'UMXn_Soil'])
+    .float();
+  return {nrm: nrm, sum: sum.float()};
 }
 
-function reconRmseFromFisher(fisherImg, fisherBands, E, abundImg, outNames){
-  var y = fisherImg.select(fisherBands).toArray().toArray(1);   // d x 1
-  var f = abundImg.select(outNames).toArray().toArray(1);       // p x 1
-  var recon = ee.Image.constant(E).matrixMultiply(f);           // d x 1
-  var resid = y.subtract(recon);
+function reconRmseFT(endmemberList, fisherImg, abundImg4) {
+  var E = ee.Array(endmemberList).matrixTranspose();
+  var Eimg = ee.Image.constant(E);
+
+  var obs = fisherImg.toArray().toArray(1);
+  var ab = abundImg4.toArray().toArray(1);
+
+  var recon = Eimg.matrixMultiply(ab);
+  var resid = obs.subtract(recon);
 
   return resid.multiply(resid)
     .arrayReduce(ee.Reducer.mean(), [0])
@@ -486,305 +442,288 @@ function reconRmseFromFisher(fisherImg, fisherBands, E, abundImg, outNames){
     .float();
 }
 
-function expandSoftLabelsToPseudoClasses(fc, repeatScale){
-  var n = ee.Number(fc.size());
-  var list = fc.toList(n);
-  var empty = ee.FeatureCollection([]);
 
-  return ee.FeatureCollection(ee.Algorithms.If(
-    n.gt(0),
-    ee.List.sequence(0, n.subtract(1)).iterate(function(idx, acc){
-      idx = ee.Number(idx);
-      var f = ee.Feature(list.get(idx));
-
-      var probs = ee.List([
-        ee.Number(f.get('TreeRatio')),
-        ee.Number(f.get('GrassRatio')),
-        ee.Number(f.get('ImpRatio')),
-        ee.Number(f.get('SoilRatio'))
-      ]);
-
-      var mx = ee.Number(probs.reduce(ee.Reducer.max()));
-      var argmax = ee.Number(probs.indexOf(mx));
-
-      var fcOne = ee.FeatureCollection(
-        ee.List.sequence(0, 3).map(function(c){
-          c = ee.Number(c);
-          var p = ee.Number(probs.get(c));
-
-          var nRep = p.multiply(repeatScale).round().toInt();
-          nRep = ee.Number(ee.Algorithms.If(c.eq(argmax), nRep.max(1), nRep));
-
-          return ee.FeatureCollection(ee.Algorithms.If(
-            nRep.gt(0),
-            ee.FeatureCollection(ee.List.sequence(1, nRep).map(function(k){
-              return ee.Feature(null, f.toDictionary()).set('cls', c);
-            })),
-            ee.FeatureCollection([])
-          ));
-        })
-      ).flatten();
-
-      return ee.FeatureCollection(acc).merge(fcOne);
-    }, empty),
-    empty
-  ));
+function collapseTGIS4toTGO3(abund4) {
+  return ee.Image.cat([
+    abund4.select('UMXn_Tree').rename('Soft_Tree'),
+    abund4.select('UMXn_Grass').rename('Soft_Grass'),
+    abund4.select('UMXn_Imperv').add(abund4.select('UMXn_Soil')).rename('Soft_Other')
+  ]).float();
 }
 
+function toRF3Labels(fc) {
+  return ee.FeatureCollection(fc).map(function(f) {
+    var t = ee.Number(ee.Algorithms.If(f.get('TreeRatio'), f.get('TreeRatio'), 0));
+    var g = ee.Number(ee.Algorithms.If(f.get('GrassRatio'), f.get('GrassRatio'), 0));
+    var i = ee.Number(ee.Algorithms.If(f.get('ImpervRatio'), f.get('ImpervRatio'), 0));
+    var s = ee.Number(ee.Algorithms.If(f.get('SoilRatio'), f.get('SoilRatio'), 0));
 
-/********************* 主分析 *********************/
-function runAnalysis(region, cityName, samplesAll){
-  var trainAOI = samplesAll.geometry().buffer(TRAIN_BUF);
-  var samplesLabeled = ensureTGISLabels(samplesAll, cityName);
+    var otherRaw = ee.Algorithms.If(
+      ee.Algorithms.IsEqual(f.get('OtherRatio'), null),
+      i.add(s),
+      f.get('OtherRatio')
+    );
+    var o = ee.Number(otherRaw);
 
-  var pureSamples = ee.FeatureCollection(samplesLabeled.filter(
-    ee.Filter.or(
-      ee.Filter.eq('TreeRatio', 1),
-      ee.Filter.eq('GrassRatio', 1),
-      ee.Filter.eq('ImpRatio', 1),
-      ee.Filter.eq('SoilRatio', 1)
-    )
-  ));
+    return f.set({
+      TreeRatio: t,
+      GrassRatio: g,
+      OtherRatio: o
+    });
+  });
+}
 
-  var nonPureSamples = ee.FeatureCollection(samplesLabeled.filter(
-    ee.Filter.and(
-      ee.Filter.neq('TreeRatio', 1),
-      ee.Filter.neq('GrassRatio', 1),
-      ee.Filter.neq('ImpRatio', 1),
-      ee.Filter.neq('SoilRatio', 1)
-    )
-  ));
+function assignSoftLabelsToMixed3(samplesFC, abund4img) {
+  var soft3img = collapseTGIS4toTGO3(abund4img);
+  var fc3 = toRF3Labels(samplesFC);
 
-  pureSamples = setTGISClassFromRatios(pureSamples);
+  var tagged = fc3.map(function(f) {
+    var t = ee.Number(ee.Algorithms.If(f.get('TreeRatio'), f.get('TreeRatio'), 0));
+    var g = ee.Number(ee.Algorithms.If(f.get('GrassRatio'), f.get('GrassRatio'), 0));
+    var o = ee.Number(ee.Algorithms.If(f.get('OtherRatio'), f.get('OtherRatio'), 0));
+    var sum = t.add(g).add(o);
 
-  /**** 2) 影像准备 ****/
+    var isPure = ee.Algorithms.If(
+      t.eq(1),
+      true,
+      ee.Algorithms.If(g.eq(1), true, o.eq(1))
+    );
+
+    var isPure3 = ee.Algorithms.If(
+      isPure,
+      ee.Algorithms.If(sum.eq(1), 1, 0),
+      0
+    );
+
+    return f.set('isPure3', isPure3);
+  });
+
+  var pure = tagged.filter(ee.Filter.eq('isPure3', 1));
+  var mixed = tagged.filter(ee.Filter.eq('isPure3', 0));
+
+  var mixedSoft = soft3img.sampleRegions({
+    collection: mixed,
+    scale: 10,
+    geometries: true
+  }).map(function(f) {
+    return f.set({
+      TreeRatio: f.get('Soft_Tree'),
+      GrassRatio: f.get('Soft_Grass'),
+      OtherRatio: f.get('Soft_Other')
+    });
+  });
+
+  return pure.merge(mixedSoft);
+}
+
+function addHardClassFromRatios(fc) {
+  return ee.FeatureCollection(fc).map(function(f) {
+    var t = ee.Number(ee.Algorithms.If(f.get('TreeRatio'), f.get('TreeRatio'), 0));
+    var g = ee.Number(ee.Algorithms.If(f.get('GrassRatio'), f.get('GrassRatio'), 0));
+    var o = ee.Number(ee.Algorithms.If(f.get('OtherRatio'), f.get('OtherRatio'), 0));
+
+    var maxV = ee.Number(ee.List([t, g, o]).reduce(ee.Reducer.max()));
+
+    var cls = ee.Number(ee.Algorithms.If(
+      t.eq(maxV), 0,
+      ee.Algorithms.If(g.eq(maxV), 1, 2)
+    ));
+
+    return f.set({
+      cls: cls,
+      label_conf: maxV
+    });
+  });
+}
+
+/********************* 导出 *********************/
+function exportToDrive(image, description, fileNamePrefix, region) {
+  var out = image.clamp(0, 1).toFloat();
+  Export.image.toDrive({
+    image: out,
+    description: description,
+    folder: DRIVE_FOLDER,
+    fileNamePrefix: fileNamePrefix,
+    region: region,
+    scale: 10,
+    maxPixels: 1e13,
+    fileFormat: 'GeoTIFF',
+    formatOptions: {cloudOptimized: true}
+  });
+}
+
+/********************* 主流程 *********************/
+function runAnalysis(region, cityName, endmemberSamples4, rfSamplesRaw3orMixed, trainBufferMeters) {
+  var TRAIN_BUF_LOCAL = trainBufferMeters || TRAIN_BUF;
+  var trainAOI = rfSamplesRaw3orMixed.geometry().buffer(TRAIN_BUF_LOCAL);
+
+  var S2_BANDS_ALL = [
+    'B2','B3','B4','B5','B6','B7','B8','B8A','B11','B12',
+    'NDVI','EVI','GCI','SAVI','NDBI','NDWI'
+  ];
+
   var statsReducer = ee.Reducer.mean()
     .combine(ee.Reducer.min(), '', true)
     .combine(ee.Reducer.max(), '', true)
     .combine(ee.Reducer.stdDev(), '', true)
     .combine(ee.Reducer.percentile([25,50,75], ['p25','p50','p75']), '', true);
 
-  // 城市
-  var s2_city_col = s2Collection(region, YEAR, MONTHS);
-  var s2idx_city = s2_city_col.map(addIndices);
-  var feature_city_base = s2idx_city.select(S2_BANDS_ALL).reduce(statsReducer).clip(region).unmask(-9999);
-  var s2core_city = s2_city_col.median().select(FISHER_BANDS).clip(region).unmask(-9999);
+  var s2_city = s2Collection(region, YEAR, MONTHS);
+  var s2idx_city = s2_city.map(addIndices);
+  var base_city = s2idx_city.select(S2_BANDS_ALL).reduce(statsReducer).clip(region).unmask(-9999);
+  var s2core_city = s2_city.select(UNMIX_BANDS).median().clip(region).unmask(-9999);
 
-  // 训练 AOI
-  var s2_train_col = s2Collection(trainAOI, YEAR, MONTHS);
-  var s2idx_train = s2_train_col.map(addIndices);
-  var feature_train_base = s2idx_train.select(S2_BANDS_ALL).reduce(statsReducer).clip(trainAOI).unmask(-9999);
-  var s2core_train = s2_train_col.median().select(FISHER_BANDS).clip(trainAOI).unmask(-9999);
+  var s2_train = s2Collection(trainAOI, YEAR, MONTHS);
+  var s2idx_train = s2_train.map(addIndices);
+  var base_train = s2idx_train.select(S2_BANDS_ALL).reduce(statsReducer).clip(trainAOI).unmask(-9999);
+  var s2core_train = s2_train.select(UNMIX_BANDS).median().clip(trainAOI).unmask(-9999);
 
-  // S1
   var s1_city = ee.ImageCollection('COPERNICUS/S1_GRD')
     .filterBounds(region)
-    .filterDate(ee.Date.fromYMD(YEAR, MONTHS[0], 1), ee.Date.fromYMD(YEAR, MONTHS[1], 1).advance(1,'month'))
-    .filter(ee.Filter.eq('instrumentMode','IW'))
-    .filter(ee.Filter.eq('orbitProperties_pass','DESCENDING'))
-    .filter(ee.Filter.listContains('transmitterReceiverPolarisation','VV'))
-    .filter(ee.Filter.listContains('transmitterReceiverPolarisation','VH'));
-
+    .filterDate(
+      ee.Date.fromYMD(YEAR, MONTHS[0], 1),
+      ee.Date.fromYMD(YEAR, MONTHS[1], 1).advance(1, 'month')
+    )
+    .filter(ee.Filter.eq('instrumentMode', 'IW'))
+    .filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING'))
+    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'));
   var vv_city = s1_city.select('VV').median().rename('VV_median');
   var vh_city = s1_city.select('VH').median().rename('VH_median');
 
   var s1_train = ee.ImageCollection('COPERNICUS/S1_GRD')
     .filterBounds(trainAOI)
-    .filterDate(ee.Date.fromYMD(YEAR, MONTHS[0], 1), ee.Date.fromYMD(YEAR, MONTHS[1], 1).advance(1,'month'))
-    .filter(ee.Filter.eq('instrumentMode','IW'))
-    .filter(ee.Filter.eq('orbitProperties_pass','DESCENDING'))
-    .filter(ee.Filter.listContains('transmitterReceiverPolarisation','VV'))
-    .filter(ee.Filter.listContains('transmitterReceiverPolarisation','VH'));
-
+    .filterDate(
+      ee.Date.fromYMD(YEAR, MONTHS[0], 1),
+      ee.Date.fromYMD(YEAR, MONTHS[1], 1).advance(1, 'month')
+    )
+    .filter(ee.Filter.eq('instrumentMode', 'IW'))
+    .filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING'))
+    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'));
   var vv_train = s1_train.select('VV').median().rename('VV_median');
   var vh_train = s1_train.select('VH').median().rename('VH_median');
 
-  // DEM
-  var dem = ee.Image('USGS/SRTMGL1_003');
+  var dem = ee.Image('USGS/SRTMGL1_003').unmask(0);
   var elevation = dem.rename('elevation');
   var slope = ee.Terrain.slope(dem).rename('slope');
   var aspect = ee.Terrain.aspect(dem).rename('aspect');
 
-  var waterSeeds = seedsFromWorldCoverTGIS(region);
-  var waterPts = stratifiedPointsSafe(waterSeeds.water, 5, N_WATER, region, 'Water(aux)')
-    .map(function(f){ return f.set('tgis', 5); });
+  var samplesCity = endmemberSamples4.filterBounds(region);
 
-  /**** 4) Fisher 拟合 ****/
-  var fisherTrainFC = sampleFisherAndReflectance(
-    s2core_city,
-    s2core_city,
-    pureSamples.merge(waterPts),
-    ['tgis']
-  );
+  var treePureCity = samplesCity.filter(ee.Filter.eq('TreeRatio', 1));
+  var grassPureCity = samplesCity.filter(ee.Filter.eq('GrassRatio', 1));
+  var impervPureCity = samplesCity.filter(ee.Filter.eq('ImpervRatio', 1));
+  var soilPureCity = samplesCity.filter(ee.Filter.eq('SoilRatio', 1));
 
-  var fisherFit = fisherFitFromSamples(
-    fisherTrainFC,
-    FISHER_BANDS,
-    'tgis',
-    [1,2,3,4,5],   // T,G,I,S,W -> 4个 Fisher 轴
-    s2core_city,
-    region
-  );
+  function sampleForEM(imgCore, fc, cls) {
+    return imgCore.sampleRegions({
+      collection: fc,
+      scale: 10,
+      geometries: false
+    })
+    .filter(ee.Filter.neq(UNMIX_BANDS[0], -9999))
+    .map(function(f) { return f.set('cls', cls); });
+  }
 
-  var fisherNames = ['F1','F2','F3','F4'];
+  var tS0 = sampleForEM(s2core_city, treePureCity, 0);
+  var gS0 = sampleForEM(s2core_city, grassPureCity, 1);
+  var iS0 = sampleForEM(s2core_city, impervPureCity, 2);
+  var sS0 = sampleForEM(s2core_city, soilPureCity, 3);
 
-  var fisher_city = projectImageToFisher(s2core_city, FISHER_BANDS, fisherFit.W, fisherNames);
-  var fisher_train = projectImageToFisher(s2core_train, FISHER_BANDS, fisherFit.W, fisherNames);
+  var pureSampled0 = tS0.merge(gS0).merge(iS0).merge(sS0);
 
-  /**** 5) Fisher 空间 KNN 筛候选端元 ****/
-  var pureCity = pureSamples.filterBounds(region);
+  var tEnd0 = meanVectorFC(tS0, UNMIX_BANDS, s2core_city, region);
+  var gEnd0 = meanVectorFC(gS0, UNMIX_BANDS, s2core_city, region);
+  var iEnd0 = meanVectorFC(iS0, UNMIX_BANDS, s2core_city, region);
+  var sEnd0 = meanVectorFC(sS0, UNMIX_BANDS, s2core_city, region);
 
-  var pureFishCityTrain = sampleFisherAndReflectance(
-    fisher_city,
-    s2core_city,
-    pureCity,
-    ['tgis']
-  );
+  var Wf = buildFisherTransform(pureSampled0, UNMIX_BANDS, s2core_city, region);
 
-  var knn = ee.Classifier.smileKNN(KNN_K).train({
-    features: pureFishCityTrain,
-    classProperty: 'tgis',
-    inputProperties: fisherNames
-  });
+  var tEnd = refineEndmemberByKNN_FSR(tS0, tEnd0, UNMIX_BANDS, Wf, s2core_city, region);
+  var gEnd = refineEndmemberByKNN_FSR(gS0, gEnd0, UNMIX_BANDS, Wf, s2core_city, region);
+  var iEnd = refineEndmemberByKNN_FSR(iS0, iEnd0, UNMIX_BANDS, Wf, s2core_city, region);
+  var sEnd = refineEndmemberByKNN_FSR(sS0, sEnd0, UNMIX_BANDS, Wf, s2core_city, region);
 
-  var knnClassImg = fisher_city.classify(knn).rename('knnClass');
+  var tEndF = projectVectorToFisher(tEnd, Wf);
+  var gEndF = projectVectorToFisher(gEnd, Wf);
+  var iEndF = projectVectorToFisher(iEnd, Wf);
+  var sEndF = projectVectorToFisher(sEnd, Wf);
 
-  /**** 6) 各类端元：KNN + FSR 提纯 ****/
-  var emTree = extractEndmemberByKnnAndFSR(
-    fisher_city, s2core_city, knnClassImg, 1, pureFishCityTrain, fisherNames, region
-  );
-  var emGrass = extractEndmemberByKnnAndFSR(
-    fisher_city, s2core_city, knnClassImg, 2, pureFishCityTrain, fisherNames, region
-  );
-  var emImp = extractEndmemberByKnnAndFSR(
-    fisher_city, s2core_city, knnClassImg, 3, pureFishCityTrain, fisherNames, region
-  );
-  var emSoil = extractEndmemberByKnnAndFSR(
-    fisher_city, s2core_city, knnClassImg, 4, pureFishCityTrain, fisherNames, region
-  );
+  var endmembersFisher = ee.List([
+    colArrayToList3(tEndF),
+    colArrayToList3(gEndF),
+    colArrayToList3(iEndF),
+    colArrayToList3(sEndF)
+  ]);
 
-  print('FSR(Tree/Grass/Imp/Soil):', emTree.fsr, emGrass.fsr, emImp.fsr, emSoil.fsr);
+  var fisher_city = projectImageToFisher(s2core_city, Wf, UNMIX_BANDS);
+  var fisher_train = projectImageToFisher(s2core_train, Wf, UNMIX_BANDS);
 
-  // Fisher 端元矩阵：4 x 4，列顺序 T/G/I/S
-  var E = ee.Array.cat([emTree.fisher, emGrass.fisher, emImp.fisher, emSoil.fisher], 1);
+  var umx_city_img = fisher_city.unmix(endmembersFisher, true, true)
+    .rename(['UMX_Tree','UMX_Grass','UMX_Imperv','UMX_Soil'])
+    .clamp(0, 1);
 
-  /**** 7) Fisher 空间解混：得到软标签 ****/
-  var abund_city = fisherConstrainedUnmix(
-    fisher_city, fisherNames, E,
-    ['UMX_Tree','UMX_Grass','UMX_Imp','UMX_Soil']
-  );
+  var umx_train_img = fisher_train.unmix(endmembersFisher, true, true)
+    .rename(['UMX_Tree','UMX_Grass','UMX_Imperv','UMX_Soil'])
+    .clamp(0, 1);
 
-  var abund_train = fisherConstrainedUnmix(
-    fisher_train, fisherNames, E,
-    ['UMX_Tree','UMX_Grass','UMX_Imp','UMX_Soil']
-  );
+  var nCity = normAbund4(umx_city_img);
+  var nTrain = normAbund4(umx_train_img);
 
-  var rmse_city = reconRmseFromFisher(
-    fisher_city, fisherNames, E, abund_city,
-    ['UMX_Tree','UMX_Grass','UMX_Imp','UMX_Soil']
-  );
+  var rmse_city = reconRmseFT(endmembersFisher, fisher_city, umx_city_img);
+  var rmse_train = reconRmseFT(endmembersFisher, fisher_train, umx_train_img);
 
-  var rmse_train = reconRmseFromFisher(
-    fisher_train, fisherNames, E, abund_train,
-    ['UMX_Tree','UMX_Grass','UMX_Imp','UMX_Soil']
-  );
+  var soft3_city = collapseTGIS4toTGO3(nCity.nrm);
+  var soft3_train = collapseTGIS4toTGO3(nTrain.nrm);
 
-  
-  /**** 8) 非纯样本赋软标签 ****/
-  var mixedSoft = ee.FeatureCollection(ee.Algorithms.If(
-    nonPureSamples.size().gt(0),
-    abund_city.sampleRegions({
-      collection: nonPureSamples,
-      scale: SCALE,
-      geometries: true
-    }).map(function(f){
-      return f.set({
-        TreeRatio:  f.get('UMX_Tree'),
-        GrassRatio: f.get('UMX_Grass'),
-        ImpRatio:   f.get('UMX_Imp'),
-        SoilRatio:  f.get('UMX_Soil')
-      });
-    }),
-    ee.FeatureCollection([])
-  ));
+  var rfSamplesAll3 = assignSoftLabelsToMixed3(rfSamplesRaw3orMixed, nCity.nrm);
 
-  var labeledSamples = pureSamples.merge(mixedSoft).distinct(['.geo']);
-  print('用于 RF 的总标签样本数:', labeledSamples.size());
+  var feature_city_base = base_city.addBands([vh_city, vv_city, aspect, elevation, slope]).clip(region);
+  var feature_train_base = base_train.addBands([vh_train, vv_train, aspect, elevation, slope]).clip(trainAOI);
 
-  /**** 9) 构造 RF 特征 ****/
   var feature_city = feature_city_base
-    .addBands([vh_city, vv_city, aspect, elevation, slope])
-    .addBands(abund_city)
-    .addBands(rmse_city)
+    .addBands([nCity.nrm, soft3_city, nCity.sum, rmse_city])
     .clip(region);
 
   var feature_train = feature_train_base
-    .addBands([vh_train, vv_train, aspect, elevation, slope])
-    .addBands(abund_train)
-    .addBands(rmse_train)
+    .addBands([nTrain.nrm, soft3_train, nTrain.sum, rmse_train])
     .clip(trainAOI);
 
   var allBands = feature_city.bandNames();
-  print('feature_city band count:', allBands.size());
+  var classNames = ['Tree', 'Grass', 'Other'];
 
-  var trainBase = feature_train.sampleRegions({
-    collection: labeledSamples,
-    properties: ['TreeRatio','GrassRatio','ImpRatio','SoilRatio'],
-    scale: SCALE,
-    geometries: false
-  })
-  .filter(ee.Filter.neq(KEY_BAND, -9999))
-  .filter(ee.Filter.notNull(['TreeRatio','GrassRatio','ImpRatio','SoilRatio']));
-  var trainFC = expandSoftLabelsToPseudoClasses(trainBase, REPEAT_SCALE);
+  var rfSamplesAll3Cls = addHardClassFromRatios(rfSamplesAll3);
+  rfSamplesAll3Cls = rfSamplesAll3Cls.filter(ee.Filter.gte('label_conf', 0.50));
+
+  var rfSamples = feature_train.sampleRegions({
+      collection: rfSamplesAll3Cls,
+      properties: ['cls', 'label_conf'],
+      scale: 10,
+      geometries: false
+    })
+    .filter(ee.Filter.neq(KEY_BAND, -9999))
+    .filter(ee.Filter.gt('UMXn_Tree', -0.5));
+
   var rfMulti = ee.Classifier.smileRandomForest(200)
     .setOutputMode('MULTIPROBABILITY')
     .train({
-      features: trainFC,
-      classProperty: 'cls',   // 0=Tree,1=Grass,2=Imp,3=Soil
+      features: rfSamples,
+      classProperty: 'cls',
       inputProperties: allBands
     });
 
   var probArr = feature_city.classify(rfMulti);
+  var probs1 = probArr.arrayFlatten([classNames]).float();
 
-  var probs = probArr.arrayFlatten([['Tree','Grass','Impervious','Soil']]);
-  var sumP = probs.reduce(ee.Reducer.sum()).rename('sumP');
-  var probs1 = probs.divide(sumP).where(sumP.eq(0), 0).float();
-  var rgbSoft = ee.Image.cat([
-    abund_city.select('UMX_Imp'),
-    abund_city.select('UMX_Tree'),
-    abund_city.select('UMX_Grass')
-  ]);
-  Map.addLayer(rgbSoft, {min:[0,0,0], max:[1,1,1]}, cityName + ' RGB SoftLabel (I/T/G)');
+  var sumP = probs1.reduce(ee.Reducer.sum()).rename('sumP');
+  probs1 = probs1.divide(sumP).where(sumP.eq(0), 0).float();
 
-  var rgbProb = ee.Image.cat([
-    probs1.select('Impervious'),
-    probs1.select('Tree'),
-    probs1.select('Grass')
-  ]);
-  Map.addLayer(rgbProb, {min:[0,0,0], max:[1,1,1]}, cityName + ' RGB Prob (I/T/G)');
-
-  /**** 11) 导出 ****/
-  function exportToDrive(image, description, fileNamePrefix){
-    Export.image.toDrive({
-      image: image.clamp(0,1).toFloat(),
-      description: description,
-      folder: EXPORT_FOLDER,
-      fileNamePrefix: fileNamePrefix,
-      region: region,
-      scale: SCALE,
-      maxPixels: 1e13,
-      fileFormat: 'GeoTIFF',
-      formatOptions: {cloudOptimized: true}
-    });
-  }
-  exportToDrive(probs1.select('Tree'),       cityName + '_Prob_Tree',       cityName + '_Prob_Tree');
-  exportToDrive(probs1.select('Grass'),      cityName + '_Prob_Grass',      cityName + '_Prob_Grass');
+  exportToDrive(probs1.select('Tree'), cityName + '_Tree', cityName + '_Tree', region);
+  exportToDrive(probs1.select('Grass'), cityName + '_Grass', cityName + '_Grass', region);
 }
 
-
-/********************* UI *********************/
-var allCitiesFC = ee.FeatureCollection(ALL_CITIES_ASSET);
-
+/********************* UI控件 *********************/
 var CURRENT_CITY_NAME = null;
 var CURRENT_REGION = null;
 
@@ -792,13 +731,10 @@ var uiPanel = ui.Panel({
   style: {width: '430px', position: 'top-left', padding: '8px'}
 });
 
-uiPanel.add(ui.Label({
-  value: '📌 城市整年分析（Fisher 软标签 + RF 多概率）',
-  style: {fontWeight: 'bold', fontSize: '14px'}
-}));
 
-var citySelect = ui.Select({placeholder: '加载城市列表中...'});
-allCitiesFC.aggregate_array('city').distinct().sort().evaluate(function(list){
+
+var citySelect = ui.Select({placeholder: '加载城市列表中…'});
+allCitiesFC.aggregate_array('city').distinct().sort().evaluate(function(list) {
   citySelect.items().reset(list);
   citySelect.setPlaceholder('选择城市');
 });
@@ -809,7 +745,7 @@ var yearBox = ui.Textbox({
 });
 
 var confirmBtn = ui.Button({
-  label: '✅ 显示边界',
+  label: '✅ 确认城市',
   style: {stretch: 'horizontal'}
 });
 
@@ -819,18 +755,14 @@ var runBtn = ui.Button({
 });
 
 uiPanel.add(ui.Panel([ui.Label('城市'), citySelect], ui.Panel.Layout.flow('horizontal')));
-uiPanel.add(ui.Panel([ui.Label('年份(可选)'), yearBox], ui.Panel.Layout.flow('horizontal')));
+uiPanel.add(ui.Panel([ui.Label('年份'), yearBox], ui.Panel.Layout.flow('horizontal')));
 uiPanel.add(confirmBtn);
 uiPanel.add(runBtn);
-
 Map.add(uiPanel);
 
-confirmBtn.onClick(function(){
+confirmBtn.onClick(function() {
   var cityName = citySelect.getValue();
-  if (!cityName){
-    print('⚠️ 请先选择城市');
-    return;
-  }
+  if (!cityName) return;
 
   var cityFC = allCitiesFC.filter(ee.Filter.eq('city', cityName));
   var region = cityFC.union(1).geometry();
@@ -838,21 +770,20 @@ confirmBtn.onClick(function(){
   Map.clear();
   Map.add(uiPanel);
   Map.centerObject(region, 10);
-  Map.addLayer(cityFC.style({color:'black', fillColor:'00000000', width:2}), {}, cityName + ' 边界');
 
   CURRENT_CITY_NAME = cityName;
   CURRENT_REGION = region;
+
+  var yrTxt = yearBox.getValue();
+  YEAR = (yrTxt && yrTxt.trim() !== '') ? parseInt(yrTxt, 10) : YEAR;
 });
 
-runBtn.onClick(function(){
+runBtn.onClick(function() {
   var cityName = CURRENT_CITY_NAME || citySelect.getValue();
-  if (!cityName){
-    print('⚠️ 请先选择城市（可先点“显示边界”）');
-    return;
-  }
+  if (!cityName) return;
 
   var region = CURRENT_REGION;
-  if (!region){
+  if (!region) {
     var cityFC = allCitiesFC.filter(ee.Filter.eq('city', cityName));
     region = cityFC.union(1).geometry();
   }
@@ -864,63 +795,36 @@ runBtn.onClick(function(){
   Map.clear();
   Map.add(uiPanel);
   Map.centerObject(region, 10);
-  Map.addLayer(
-    ee.FeatureCollection(ALL_CITIES_ASSET)
-      .filter(ee.Filter.eq('city', cityName))
-      .style({color:'black', fillColor:'00000000', width:2}),
-    {},
-    cityName + ' 边界'
-  );
 
-  print('▶️ 开始分析：城市=' + cityName + '，YEAR=' + YEAR + '（整年 1–12 月）');
   runAllForUI(region, cityName);
 });
 
+/********************* UI 封装运行 *********************/
+function runAllForUI(region, cityName) {
+  var auto4 = buildAutoSamplesTGIS(region, cityName);
 
-/********************* 运行入口 *********************/
-function runAllForUI(region, cityName){
-  var seeds = seedsFromWorldCoverTGIS(region);
-
-  var treePts  = stratifiedPointsSafe(seeds.tree,  1, N_TREE,  region, 'Tree');
-  var grassPts = stratifiedPointsSafe(seeds.grass, 2, N_GRASS, region, 'Grass');
-  var impPts   = stratifiedPointsSafe(seeds.imp,   3, N_IMP,   region, 'Impervious');
-  var soilPts  = stratifiedPointsSafe(seeds.soil,  4, N_SOIL,  region, 'Soil');
-
-  var autoPure = ee.FeatureCollection(treePts)
-    .merge(grassPts)
-    .merge(impPts)
-    .merge(soilPts)
-    .map(function(f){
-      var c = ee.Number(f.get('class'));
-      return f.set({
-        TreeRatio:  ee.Number(ee.Algorithms.If(c.eq(1), 1, 0)),
-        GrassRatio: ee.Number(ee.Algorithms.If(c.eq(2), 1, 0)),
-        ImpRatio:   ee.Number(ee.Algorithms.If(c.eq(3), 1, 0)),
-        SoilRatio:  ee.Number(ee.Algorithms.If(c.eq(4), 1, 0)),
-        city: cityName
-      });
-    })
-    .distinct(['.geo']);
+  var autoRF3 = auto4.map(function(f) {
+    return f.set({
+      TreeRatio: ee.Number(f.get('RF_TreeRatio')),
+      GrassRatio: ee.Number(f.get('RF_GrassRatio')),
+      OtherRatio: ee.Number(f.get('RF_OtherRatio'))
+    });
+  });
 
   var manualLoad = tryLoadManualSamples(MANUAL_SHP_ASSET);
+  var manualRF3 = ee.FeatureCollection([]);
 
-  var manualFiltered = ee.FeatureCollection(ee.Algorithms.If(
-    manualLoad.has,
-    ensureTGISLabels(ee.FeatureCollection(manualLoad.fc).filterBounds(region), cityName),
-    ee.FeatureCollection([])
-  ));
+  if (manualLoad.has) {
+    manualRF3 = ensureRF3OneHot(manualLoad.fc).filterBounds(region);
+  }
 
-  var samplesAll = ee.FeatureCollection(ee.Algorithms.If(
-    manualLoad.has,
-    autoPure.merge(manualFiltered),
-    autoPure
-  )).distinct(['.geo']);
+  var rfSamplesAll = ee.FeatureCollection(
+    ee.Algorithms.If(
+      manualLoad.has,
+      autoRF3.merge(manualRF3),
+      autoRF3
+    )
+  ).distinct(['.geo']);
 
-  var nTree  = samplesAll.filter(ee.Filter.eq('TreeRatio', 1)).size();
-  var nGrass = samplesAll.filter(ee.Filter.eq('GrassRatio', 1)).size();
-  var nImp   = samplesAll.filter(ee.Filter.eq('ImpRatio', 1)).size();
-  var nSoil  = samplesAll.filter(ee.Filter.eq('SoilRatio', 1)).size();
-  var nAll   = samplesAll.size();
-
-  runAnalysis(region, cityName, samplesAll);
+  runAnalysis(region, cityName, auto4, rfSamplesAll, TRAIN_BUF);
 }
