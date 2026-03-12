@@ -1,6 +1,6 @@
 # Urban Tree and Grassland Cover Mapping in European Cities
 
-This repository contains the Google Earth Engine (GEE) code for our study: **A Novel Framework and Automated Algorithm for Subpixel Classification Mapping of Trees and Grasslands in European Cities from Sentinel-1/2 Satellite imagery**.
+This repository contains the Google Earth Engine (GEE) code for our study: **A Novel Framework and Automated Algorithm for Subpixel Mapping of Trees and Grasslands in European Cities from Sentinel-1/2 Satellite Imagery**.
 
 To support fine-scale urban green space assessment in Europe, we developed an automated sub-pixel classification framework for mapping trees and grasslands in complex urban environments. This method is based on Sentinel-1/2 images, and uses the random forest (RF) technique on the Google Earth Engine (GEE) platform to achieve sub-pixel mapping of urban trees and grasslands. Using this method, we created 10-m resolution tree and grassland cover products for 103 European cities and made them freely available to the community (https://doi.org/10.6084/m9.figshare.31566298).
 
@@ -47,14 +47,16 @@ runAll();
 
 ## Acknowledgement
 
-This repository is built upon our study on automated sub-pixel mapping of urban trees and grasslands in Europe. We thank the providers of Sentinel-1/2, ESA WorldCover, Dynamic World, SRTM DEM, and related open geospatial datasets used in this work. We also acknowledge prior studies on spectral unmixing, urban vegetation mapping, and large-scale geospatial analysis on Google Earth Engine that inspired this implementation.
+This repository is built upon our study on automated subpixel mapping of urban trees and grasslands in Europe. We thank the providers of Sentinel-1/2, ESA WorldCover, Dynamic World, SRTM DEM, and related open geospatial datasets used in this work. We also acknowledge prior studies on spectral unmixing, urban vegetation mapping, and large-scale geospatial analysis on Google Earth Engine that inspired this implementation.
 
 ## Citation
 
 ```bibtex
-@misc{GuoUrbanTreeGrassEurope,
-  title  = {A Novel Framework and Automated Algorithm for Subpixel Classification Mapping of Trees and Grasslands in European Cities from Sentinel-1/2 Satellite imagery},
-  author = {Jianhua Guo and Danfeng Hong and Zhiheng Liu and Xiao Xiang Zhu},
-  note   = {Please update this entry with the final publication information},
+@article{Guo2026novel,
+  title  = {A Novel Framework and Automated Algorithm for Subpixel Mapping of Trees and Grasslands in European Cities from Sentinel-1/2 Satellite imagery},
+  author = {Guo, Jianhua and Wang, wenna and Wang jingxue and Sun, xin and Liang, dong and Sun, zhongchang and Guo, huadong},
+  journal={Remote Sensing of Environment},
+  year={2026},
+  publisher={Elsevier}
 }
 ```
