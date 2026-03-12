@@ -1,6 +1,6 @@
 # Urban Tree and Grassland Cover Mapping in European Cities
 
-This repository contains the Google Earth Engine (GEE) code for our study: **A Novel Framework and Automated Algorithm for Subpixel Mapping of Trees and Grasslands in European Cities from Sentinel-1/2 Satellite Imagery**.
+This repository contains the Google Earth Engine (GEE) code for our study: **Subpixel Mapping of Trees and Grasslands in European Cities from Sentinel-1/2 Imagery**.
 
 To support fine-scale urban green space assessment in Europe, we developed an automated sub-pixel classification framework for mapping trees and grasslands in complex urban environments. This method is based on Sentinel-1/2 images, and uses the random forest (RF) technique on the Google Earth Engine (GEE) platform to achieve sub-pixel mapping of urban trees and grasslands. Using this method, we created 10-m resolution tree and grassland cover products for 103 European cities and made them freely available to the community (https://doi.org/10.6084/m9.figshare.31566298).
 
