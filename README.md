@@ -53,7 +53,7 @@ This repository is built upon our study on automated subpixel mapping of urban t
 
 ```bibtex
 @article{Guo2026novel,
-  title  = {A Novel Framework and Automated Algorithm for Subpixel Mapping of Trees and Grasslands in European Cities from Sentinel-1/2 Satellite imagery},
+  title  = {Subpixel Mapping of Trees and Grasslands in European Cities from Sentinel-1/2 Imagery},
   author = {Guo, Jianhua and Wang, wenna and Wang jingxue and Sun, xin and Liang, dong and Sun, zhongchang and Guo, huadong},
   journal={Remote Sensing of Environment},
   year={2026},
