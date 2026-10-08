@@ -1,830 +1,5052 @@
-/********************* 用户配置区 *********************/
-var MANUAL_SHP_ASSET = '';
-var DRIVE_FOLDER = 'GEE_Unmix';
+
+/***************************************************************
+ CONFIGURATION AND CONSTANTS
+ ***************************************************************/
+
+var MANUAL_SHP_ASSET =
+  ' ';
+
+var ALL_CITIES_ASSET =
+  ' ';
 
 var YEAR = 2024;
+
 var MONTHS = [1, 12];
-var CLOUD_PCT = 20;
+
+var CLOUD_PCT = 10;
+
 var SCALE = 10;
 
-var N_TREE = 400;
-var N_GRASS = 400;
-var N_IMPERV = 400;
-var N_SOIL = 400;
+var N_TREE = 250;
+
+var N_GRASS = 250;
+
+var N_IMPERVIOUS = 250;
+
+var N_SOIL = 250;
+
+var N_MIXED = 500;
+
 var ERODE_PIX = 3;
 
-var UNMIX_BANDS = ['B2', 'B3', 'B4', 'B8', 'B11', 'B12'];
-var LAMBDA = 1e-3;
 
-var KNN_K = 60;
-var FSR_PCTL = 85;
+var FISHER_BANDS = [
 
+  'B2',
+  'B3',
+  'B4',
+  'B5',
+  'B6',
+  'B7',
+  'B8',
+  'B8A',
+  'B11',
+  'B12'
+
+];
+
+
+var FISHER_DIMS = 3;
+var FISHER_REG = 1e-6;
+var KNN_K = 8;
+var KNN_MIN = 4;
+var KNN_RADIUS = 3.0;
+var PSEUDO_KEEP_PERCENTILE = 90;
+var FCLS_RIDGE = 1e-8;
+var RF_TREES = 200;
+var RF_SEED = 2026;
+var LOGRATIO_EPS = 0.001;
 var TRAIN_BUF = 10000;
+var DRIVE_FOLDER =
+  'GEE_LocalFisher_CompositionalRF';
 var KEY_BAND = 'B4_mean';
 
-var ALL_CITIES_ASSET = '';
-var allCitiesFC = ee.FeatureCollection(ALL_CITIES_ASSET);
+/***************************************************************
+PREPROCESSING
+ ***************************************************************/
 
-/********************* 通用小工具 *********************/
 function s2Collection(region, year, months) {
-  var t0 = ee.Date.fromYMD(year, months[0], 1);
-  var t1 = ee.Date.fromYMD(year, months[1], 1).advance(1, 'month');
-  return ee.ImageCollection('COPERNICUS/S2_SR')
+
+  var start =
+    ee.Date.fromYMD(
+      year,
+      months[0],
+      1
+    );
+
+  var end =
+    ee.Date.fromYMD(
+      year,
+      months[1],
+      1
+    ).advance(
+      1,
+      'month'
+    );
+
+  return ee.ImageCollection(
+      'COPERNICUS/S2_SR'
+    )
     .filterBounds(region)
-    .filterDate(t0, t1)
-    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', CLOUD_PCT));
+    .filterDate(
+      start,
+      end
+    )
+    .filter(
+      ee.Filter.lt(
+        'CLOUDY_PIXEL_PERCENTAGE',
+        CLOUD_PCT
+      )
+    );
 }
 
 function addIndices(img) {
-  var ndvi = img.normalizedDifference(['B8', 'B4']).rename('NDVI');
-  var evi = img.expression(
-    '2.5*((NIR-RED)/(NIR+6*RED-7.5*BLUE+1))',
-    {NIR: img.select('B8'), RED: img.select('B4'), BLUE: img.select('B2')}
-  ).rename('EVI');
-  var gci = img.expression('(NIR/GREEN)-1', {
-    NIR: img.select('B8'),
-    GREEN: img.select('B3')
-  }).rename('GCI');
-  var savi = img.expression('((NIR-RED)/(NIR+RED+0.5))*1.5', {
-    NIR: img.select('B8'),
-    RED: img.select('B4')
-  }).rename('SAVI');
-  var ndbi = img.normalizedDifference(['B11', 'B8']).rename('NDBI');
-  var ndwi = img.normalizedDifference(['B3', 'B8']).rename('NDWI');
 
-  var base = img.select(['B2','B3','B4','B5','B6','B7','B8','B8A','B11','B12']);
-  return base.addBands([ndvi, evi, gci, savi, ndbi, ndwi]);
-}
-
-function maskCount(img, region, scale) {
-  var d = ee.Dictionary(
-    img.mask().reduceRegion({
-      reducer: ee.Reducer.sum(),
-      geometry: region,
-      scale: scale,
-      maxPixels: 1e12,
-      bestEffort: true
-    })
-  );
-  var vals = d.values();
-  var hasVal = ee.Number(vals.size()).gt(0);
-  return ee.Number(ee.Algorithms.If(hasVal, vals.get(0), 0));
-}
-
-function stratifiedPointsSafe(seedImg, classValue, nPerClass, region) {
-  var cnt = maskCount(seedImg, region, SCALE);
-  return ee.FeatureCollection(ee.Algorithms.If(
-    cnt.gt(0),
-    seedImg.updateMask(seedImg).rename('class').multiply(classValue).toInt()
-      .stratifiedSample({
-        numPoints: nPerClass,
-        classBand: 'class',
-        region: region,
-        scale: SCALE,
-        geometries: true,
-        classValues: [classValue],
-        classPoints: [nPerClass],
-        seed: 42
-      }),
-    ee.FeatureCollection([])
-  ));
-}
-
-function tryLoadManualSamples(path) {
-  if (!path || path === '') return {has: false, fc: ee.FeatureCollection([])};
-  var has = false;
-  var fc = ee.FeatureCollection([]);
-  try {
-    fc = ee.FeatureCollection(path);
-    var c = fc.limit(1).size().getInfo();
-    has = (c >= 0);
-  } catch (err) {
-    has = false;
-    fc = ee.FeatureCollection([]);
-  }
-  return {has: has, fc: fc};
-}
-
-function ensureRF3OneHot(fc) {
-  return ee.FeatureCollection(fc).map(function(f) {
-    var hasTree = f.get('TreeRatio');
-    var hasGrass = f.get('GrassRatio');
-    var hasOther = f.get('OtherRatio');
-
-    var needFill = ee.Algorithms.If(
-      ee.Algorithms.IsEqual(hasTree, null),
-      true,
-      ee.Algorithms.If(
-        ee.Algorithms.IsEqual(hasGrass, null),
-        true,
-        ee.Algorithms.IsEqual(hasOther, null)
-      )
+  var ndvi =
+    img.normalizedDifference([
+      'B8',
+      'B4'
+    ])
+    .rename(
+      'NDVI'
     );
 
-    var c = ee.Number(ee.Algorithms.If(f.get('class'), f.get('class'), -999));
+  var evi =
+    img.expression(
+      '2.5*((NIR-RED)/(NIR+6*RED-7.5*BLUE+1))',
+      {
 
-    var lab = ee.Dictionary(ee.Algorithms.If(
-      needFill,
-      ee.Algorithms.If(
-        c.eq(1), ee.Dictionary({'TreeRatio':1,'GrassRatio':0,'OtherRatio':0}),
-        ee.Algorithms.If(
-          c.eq(2), ee.Dictionary({'TreeRatio':0,'GrassRatio':1,'OtherRatio':0}),
-          ee.Algorithms.If(
-            c.eq(3), ee.Dictionary({'TreeRatio':0,'GrassRatio':0,'OtherRatio':1}),
-            ee.Dictionary({'TreeRatio':0,'GrassRatio':0,'OtherRatio':0})
-          )
-        )
-      ),
-      ee.Dictionary({})
-    ));
+        NIR:
+          img.select('B8'),
 
-    return f.set(lab);
-  }).filter(
-    ee.Filter.or(
-      ee.Filter.eq('TreeRatio', 1),
-      ee.Filter.or(
-        ee.Filter.eq('GrassRatio', 1),
-        ee.Filter.eq('OtherRatio', 1)
-      )
+        RED:
+          img.select('B4'),
+
+        BLUE:
+          img.select('B2')
+
+      }
+    )
+    .rename(
+      'EVI'
+    );
+
+  var gci =
+    img.expression(
+      '(NIR/GREEN)-1',
+      {
+
+        NIR:
+          img.select('B8'),
+
+        GREEN:
+          img.select('B3')
+
+      }
+    )
+    .rename(
+      'GCI'
+    );
+
+  var savi =
+    img.expression(
+      '((NIR-RED)/(NIR+RED+0.5))*1.5',
+      {
+
+        NIR:
+          img.select('B8'),
+
+        RED:
+          img.select('B4')
+
+      }
+    )
+    .rename(
+      'SAVI'
+    );
+
+  var ndbi =
+    img.normalizedDifference([
+      'B11',
+      'B8'
+    ])
+    .rename(
+      'NDBI'
+    );
+
+  var ndwi =
+    img.normalizedDifference([
+      'B8',
+      'B11'
+    ])
+    .rename(
+      'NDWI'
+    );
+
+  var base =
+    img.select([
+
+      'B2',
+      'B3',
+      'B4',
+      'B5',
+      'B6',
+      'B7',
+      'B8',
+      'B8A',
+      'B11',
+      'B12'
+
+    ]);
+
+  return base.addBands([
+
+    ndvi,
+    evi,
+    gci,
+    savi,
+    ndbi,
+    ndwi
+
+  ]);
+}
+
+/***************************************************************
+ * MODULE 3: SAMPLE CONSTRUCTION
+ ***************************************************************/
+
+function maskCount(
+  img,
+  region,
+  scale
+) {
+
+  var d =
+    ee.Dictionary(
+      img.mask().reduceRegion({
+
+        reducer:
+          ee.Reducer.sum(),
+
+        geometry:
+          region,
+
+        scale:
+          scale,
+
+        maxPixels:
+          1e12,
+
+        bestEffort:
+          true
+
+      })
+    );
+
+  var vals =
+    d.values();
+
+  return ee.Number(
+    ee.Algorithms.If(
+
+      ee.Number(
+        vals.size()
+      ).gt(0),
+
+      vals.get(0),
+
+      0
+
     )
   );
 }
 
-/********************* TGIS *********************/
-function seedsFromWorldCoverTGIS(region) {
-  var wc = ee.Image('ESA/WorldCover/v200/2021').select('Map').clip(region);
-  var s2Med = s2Collection(region, YEAR, MONTHS).map(addIndices).median();
 
-  var ndvi = s2Med.select('NDVI');
-  var ndwi = s2Med.select('NDWI');
+function buildPureAndMixedMasks(region) {
 
-  var dw = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1')
-    .filterBounds(region)
-    .filterDate(
-      ee.Date.fromYMD(YEAR, MONTHS[0], 1),
-      ee.Date.fromYMD(YEAR, MONTHS[1], 1).advance(1, 'month')
+  var wc =
+    ee.Image(
+      'ESA/WorldCover/v200/2021'
     )
-    .select('label')
+    .select(
+      'Map'
+    )
+    .clip(
+      region
+    );
+
+  var s2Med =
+    s2Collection(
+      region,
+      YEAR,
+      MONTHS
+    )
+    .map(
+      addIndices
+    )
+    .median()
+    .clip(
+      region
+    );
+
+  var ndvi =
+    s2Med.select(
+      'NDVI'
+    );
+
+  var ndwi =
+    s2Med.select(
+      'NDWI'
+    );
+
+  var ndbi =
+    s2Med.select(
+      'NDBI'
+    );
+  var dw =
+    ee.ImageCollection(
+      'GOOGLE/DYNAMICWORLD/V1'
+    )
+    .filterBounds(
+      region
+    )
+    .filterDate(
+
+      ee.Date.fromYMD(
+        YEAR,
+        1,
+        1
+      ),
+
+      ee.Date.fromYMD(
+        YEAR,
+        12,
+        1
+      ).advance(
+        1,
+        'month'
+      )
+
+    )
+    .select(
+      'label'
+    )
     .mode()
-    .clip(region);
+    .clip(
+      region
+    );
 
-  var built = dw.eq(6);
-  var bare = dw.eq(7);
-  var water = wc.eq(80).or(ndwi.gte(0.3));
+  var dwTrees =
+    dw.eq(1);
 
-  var tree = wc.eq(10)
-    .focal_min({radius: ERODE_PIX, units: 'pixels'})
-    .updateMask(ndvi.gte(0.55))
-    .updateMask(water.not());
+  var dwGrass =
+    dw.eq(2);
 
-  var grass = wc.eq(30)
-    .focal_min({radius: ERODE_PIX, units: 'pixels'})
-    .updateMask(ndvi.gte(0.25).and(ndvi.lt(0.75)))
-    .updateMask(water.not());
+  var dwBuilt =
+    dw.eq(6);
 
-  var imperv = wc.eq(50).or(built)
-    .focal_min({radius: ERODE_PIX, units: 'pixels'})
-    .updateMask(ndvi.lt(0.25))
-    .updateMask(ndwi.lt(0.15));
+  var dwBare =
+    dw.eq(7);
 
-  var soil = wc.eq(60).or(bare)
-    .focal_min({radius: ERODE_PIX, units: 'pixels'})
-    .updateMask(ndvi.lt(0.20))
-    .updateMask(ndwi.lt(0.15))
-    .updateMask(imperv.not())
-    .updateMask(water.not());
+  var water =
+    ndwi.gte(
+      0.30
+    );
+  var tree =
+    wc.eq(10)
+      .and(
+        dwTrees
+      )
+
+      .focal_min({
+
+        radius:
+          ERODE_PIX,
+
+        units:
+          'pixels'
+
+      })
+
+      .updateMask(
+
+        ndvi.gte(0.50)
+
+          .and(
+            ndwi.lt(0.20)
+          )
+
+          .and(
+            dwBuilt.not()
+          )
+
+          .and(
+            dwBare.not()
+          )
+
+      )
+
+      .selfMask();
+  var grass =
+    wc.eq(30)
+      .and(
+        dwGrass
+      )
+
+      .focal_min({
+
+        radius:
+          ERODE_PIX,
+
+        units:
+          'pixels'
+
+      })
+
+      .updateMask(
+
+        ndvi.gte(0.25)
+
+          .and(
+            ndvi.lt(0.65)
+          )
+
+          .and(
+            ndwi.lt(0.20)
+          )
+
+          .and(
+            dwBuilt.not()
+          )
+
+      )
+
+      .selfMask();
+  var imperviousBase =
+    wc.eq(50)
+      .and(
+        dwBuilt
+      );
+
+  var impervious =
+    imperviousBase
+
+      .focal_min({
+
+        radius:
+          ERODE_PIX,
+
+        units:
+          'pixels'
+
+      })
+
+      .updateMask(
+
+        ndvi.lt(0.25)
+
+          .and(
+            ndwi.lt(0.20)
+          )
+
+          .and(
+            ndbi.gt(-0.10)
+          )
+
+      )
+
+      .selfMask();
+
+  var soilBase =
+    wc.eq(60)
+
+      .and(
+        dwBare
+      )
+
+      .and(
+        imperviousBase.not()
+      );
+
+  var soil =
+    soilBase
+
+      .focal_min({
+
+        radius:
+          ERODE_PIX,
+
+        units:
+          'pixels'
+
+      })
+
+      .updateMask(
+
+        ndvi.lt(0.30)
+
+          .and(
+            ndwi.lt(0.20)
+          )
+
+          .and(
+            water.not()
+          )
+
+      )
+
+      .selfMask();
+  var pureUnion =
+    tree.unmask(0)
+
+      .or(
+        grass.unmask(0)
+      )
+
+      .or(
+        impervious.unmask(0)
+      )
+
+      .or(
+        soil.unmask(0)
+      );
+
+  var valid =
+    s2Med
+      .select('B4')
+      .mask()
+
+      .and(
+        water.not()
+      );
+
+  var mixed =
+    valid
+
+      .and(
+        pureUnion.not()
+      )
+
+      .selfMask()
+
+      .rename(
+        'mixed'
+      );
 
   return {
-    tree: tree.selfMask(),
-    grass: grass.selfMask(),
-    imperv: imperv.selfMask(),
-    soil: soil.selfMask()
+
+    tree:
+      tree,
+
+    grass:
+      grass,
+
+    impervious:
+      impervious,
+
+    soil:
+      soil,
+
+    mixed:
+      mixed
+
+  };
+}
+function stratifiedPointsSafe(
+  mask,
+  classValue,
+  n,
+  region,
+  name
+) {
+
+  var count =
+    maskCount(
+      mask,
+      region,
+      SCALE
+    );
+
+  return ee.FeatureCollection(
+
+    ee.Algorithms.If(
+
+      count.gt(0),
+
+      mask
+        .rename(
+          'class'
+        )
+        .multiply(
+          classValue
+        )
+        .toInt()
+        .stratifiedSample({
+
+          numPoints:
+            n,
+
+          classBand:
+            'class',
+
+          region:
+            region,
+
+          scale:
+            SCALE,
+
+          classValues:
+            [classValue],
+
+          classPoints:
+            [n],
+
+          seed:
+            42,
+
+          geometries:
+            true
+
+        }),
+
+      ee.FeatureCollection([])
+
+    )
+  );
+}
+
+function randomMixedPoints(
+  mask,
+  n,
+  region
+) {
+
+  return mask.sample({
+
+      region:
+        region,
+
+      scale:
+        SCALE,
+
+      numPixels:
+        n,
+
+      seed:
+        2026,
+
+      geometries:
+        true,
+
+      tileScale:
+        4
+
+    })
+
+    .map(
+      function(f) {
+
+        return f.set({
+
+          sample_type:
+            'mixed_auto'
+
+        });
+
+      }
+    );
+}
+function tryLoadManualSamples(path) {
+
+  if (
+    !path ||
+    path === ''
+  ) {
+
+    return {
+
+      has:
+        false,
+
+      fc:
+        ee.FeatureCollection([])
+
+    };
+
+  }
+
+  var has =
+    false;
+
+  var fc =
+    ee.FeatureCollection([]);
+
+  try {
+
+    fc =
+      ee.FeatureCollection(
+        path
+      );
+
+    fc.limit(1)
+      .size()
+      .getInfo();
+
+    has =
+      true;
+
+  }
+
+  catch (err) {
+
+    has =
+      false;
+
+  }
+
+  return {
+
+    has:
+      has,
+
+    fc:
+      fc
+
   };
 }
 
-function buildAutoSamplesTGIS(region, cityName) {
-  var seeds = seedsFromWorldCoverTGIS(region);
+function normalizeManualLabels(fc) {
 
-  var treePts = stratifiedPointsSafe(seeds.tree, 1, N_TREE, region);
-  var grassPts = stratifiedPointsSafe(seeds.grass, 2, N_GRASS, region);
-  var impervPts = stratifiedPointsSafe(seeds.imperv, 3, N_IMPERV, region);
-  var soilPts = stratifiedPointsSafe(seeds.soil, 4, N_SOIL, region);
+  return ee.FeatureCollection(fc)
 
-  var auto4 = ee.FeatureCollection(treePts)
-    .merge(grassPts)
-    .merge(impervPts)
-    .merge(soilPts)
-    .map(function(f) {
-      var c = ee.Number(f.get('class'));
+    .map(
+      function(f) {
 
-      var tgis = ee.Dictionary(ee.Algorithms.If(
-        c.eq(1), ee.Dictionary({'TreeRatio':1,'GrassRatio':0,'ImpervRatio':0,'SoilRatio':0}),
-        ee.Algorithms.If(
-          c.eq(2), ee.Dictionary({'TreeRatio':0,'GrassRatio':1,'ImpervRatio':0,'SoilRatio':0}),
+        var names =
+          f.propertyNames();
+
+        var hasT =
+          names.contains(
+            'TreeRatio'
+          );
+
+        var hasG =
+          names.contains(
+            'GrassRatio'
+          );
+
+        var hasO =
+          names.contains(
+            'OtherRatio'
+          );
+
+        var hasClass =
+          names.contains(
+            'class'
+          );
+
+        var hasRatio =
           ee.Algorithms.If(
-            c.eq(3), ee.Dictionary({'TreeRatio':0,'GrassRatio':0,'ImpervRatio':1,'SoilRatio':0}),
-            ee.Dictionary({'TreeRatio':0,'GrassRatio':0,'ImpervRatio':0,'SoilRatio':1})
+
+            hasT,
+
+            ee.Algorithms.If(
+
+              hasG,
+
+              ee.Algorithms.If(
+
+                hasO,
+
+                true,
+
+                false
+
+              ),
+
+              false
+
+            ),
+
+            false
+
+          );
+
+        var tRaw =
+          ee.Number(
+            ee.Algorithms.If(
+
+              hasRatio,
+
+              f.get(
+                'TreeRatio'
+              ),
+
+              ee.Algorithms.If(
+
+                hasClass,
+
+                ee.Algorithms.If(
+
+                  ee.Number(
+                    f.get('class')
+                  ).eq(1),
+
+                  1,
+
+                  0
+
+                ),
+
+                -1
+
+              )
+
+            )
+          );
+
+        var gRaw =
+          ee.Number(
+            ee.Algorithms.If(
+
+              hasRatio,
+
+              f.get(
+                'GrassRatio'
+              ),
+
+              ee.Algorithms.If(
+
+                hasClass,
+
+                ee.Algorithms.If(
+
+                  ee.Number(
+                    f.get('class')
+                  ).eq(2),
+
+                  1,
+
+                  0
+
+                ),
+
+                -1
+
+              )
+
+            )
+          );
+
+        var oRaw =
+          ee.Number(
+            ee.Algorithms.If(
+
+              hasRatio,
+
+              f.get(
+                'OtherRatio'
+              ),
+
+              ee.Algorithms.If(
+
+                hasClass,
+
+                ee.Algorithms.If(
+
+                  ee.Number(
+                    f.get('class')
+                  ).eq(3),
+
+                  1,
+
+                  0
+
+                ),
+
+                -1
+
+              )
+
+            )
+          );
+
+        var ok =
+          ee.Number(
+            ee.Algorithms.If(
+              tRaw.gte(0),
+              1,
+              0
+            )
           )
-        )
-      ));
 
-      var tgo = ee.Dictionary(ee.Algorithms.If(
-        c.eq(1), ee.Dictionary({'RF_TreeRatio':1,'RF_GrassRatio':0,'RF_OtherRatio':0}),
-        ee.Algorithms.If(
-          c.eq(2), ee.Dictionary({'RF_TreeRatio':0,'RF_GrassRatio':1,'RF_OtherRatio':0}),
-          ee.Dictionary({'RF_TreeRatio':0,'RF_GrassRatio':0,'RF_OtherRatio':1})
-        )
-      ));
+          .multiply(
 
-      return f.set(tgis).set(tgo).set({'city': cityName});
-    })
-    .distinct(['.geo']);
+            ee.Number(
+              ee.Algorithms.If(
+                gRaw.gte(0),
+                1,
+                0
+              )
+            )
 
-  return auto4;
-}
+          )
 
-/********************* Fisher-transformed LSMA 工具函数 *********************/
-function listToColArray(list) {
-  list = ee.List(list);
-  return ee.Array(list.map(function(v) { return [v]; }));
-}
+          .multiply(
 
-function meanVectorFC(fc, bandList, fallbackImg, fbGeom) {
-  fc = ee.FeatureCollection(fc);
-  bandList = ee.List(bandList);
-  var count = fc.size();
+            ee.Number(
+              ee.Algorithms.If(
+                oRaw.gte(0),
+                1,
+                0
+              )
+            )
 
-  var vals = bandList.map(function(b) {
-    b = ee.String(b);
-    return ee.Algorithms.If(
-      count.gt(0),
-      fc.aggregate_mean(b),
-      fallbackImg.select([b]).reduceRegion({
-        reducer: ee.Reducer.mean(),
-        geometry: fbGeom,
-        scale: 10,
-        maxPixels: 1e10,
-        bestEffort: true
-      }).get(b)
-    );
-  });
-  return listToColArray(vals);
-}
+          );
 
-function safeCov(fc, bandList) {
-  fc = ee.FeatureCollection(fc);
-  bandList = ee.List(bandList);
+        var t =
+          tRaw.max(0);
 
-  var n = ee.Number(fc.size());
-  var p = bandList.size();
-  var eye = ee.Array.identity(p);
+        var g =
+          gRaw.max(0);
 
-  return ee.Array(ee.Algorithms.If(
-    n.gt(1),
-    ee.Array(
-      bandList.map(function(bi) {
-        bi = ee.String(bi);
-        var mui = ee.Number(fc.aggregate_mean(bi));
+        var o =
+          oRaw.max(0);
 
-        return bandList.map(function(bj) {
-          bj = ee.String(bj);
-          var muj = ee.Number(fc.aggregate_mean(bj));
+        var sum =
+          t.add(g)
+            .add(o);
 
-          var withCovTerm = fc.map(function(f) {
-            var xi = ee.Number(f.get(bi));
-            var xj = ee.Number(f.get(bj));
-            var term = xi.subtract(mui).multiply(xj.subtract(muj));
-            return f.set('cov_term_tmp', term);
-          });
+        var tN =
+          ee.Number(
+            ee.Algorithms.If(
 
-          var s = ee.Number(withCovTerm.aggregate_sum('cov_term_tmp'));
-          return s.divide(n.subtract(1));
+              sum.gt(0),
+
+              t.divide(sum),
+
+              0
+
+            )
+          );
+
+        var gN =
+          ee.Number(
+            ee.Algorithms.If(
+
+              sum.gt(0),
+
+              g.divide(sum),
+
+              0
+
+            )
+          );
+
+        var oN =
+          ee.Number(
+            ee.Algorithms.If(
+
+              sum.gt(0),
+
+              o.divide(sum),
+
+              0
+
+            )
+          );
+
+        var finalOK =
+          ok.multiply(
+
+            ee.Number(
+              ee.Algorithms.If(
+
+                sum.gt(0),
+
+                1,
+
+                0
+
+              )
+            )
+
+          );
+
+        return f.set({
+
+          TreeRatio:
+            tN,
+
+          GrassRatio:
+            gN,
+
+          OtherRatio:
+            oN,
+
+          sample_type:
+            'manual',
+
+          label_ok:
+            finalOK
+
         });
-      })
-    ),
-    eye.multiply(1e-6)
-  ));
+
+      }
+    )
+
+    .filter(
+      ee.Filter.eq(
+        'label_ok',
+        1
+      )
+    );
 }
 
-function buildFisherTransform(pureSampledFC, bandList, fallbackImg, fbGeom) {
-  var p = ee.List(bandList).size();
-  var I = ee.Array.identity(p);
+/***************************************************************
+ * MODULE 4: FISHER PROJECTION UTILITIES
+ ***************************************************************/
 
-  var c0 = pureSampledFC.filter(ee.Filter.eq('cls', 0));
-  var c1 = pureSampledFC.filter(ee.Filter.eq('cls', 1));
-  var c2 = pureSampledFC.filter(ee.Filter.eq('cls', 2));
-  var c3 = pureSampledFC.filter(ee.Filter.eq('cls', 3));
+function featureMeanVector(
+  fc,
+  bands
+) {
 
-  var n0 = ee.Number(c0.size());
-  var n1 = ee.Number(c1.size());
-  var n2 = ee.Number(c2.size());
-  var n3 = ee.Number(c3.size());
+  bands =
+    ee.List(
+      bands
+    );
 
-  var mu0 = meanVectorFC(c0, bandList, fallbackImg, fbGeom);
-  var mu1 = meanVectorFC(c1, bandList, fallbackImg, fbGeom);
-  var mu2 = meanVectorFC(c2, bandList, fallbackImg, fbGeom);
-  var mu3 = meanVectorFC(c3, bandList, fallbackImg, fbGeom);
+  return ee.Array(
 
-  var Sw = safeCov(c0, bandList).multiply(n0.subtract(1).max(0))
-    .add(safeCov(c1, bandList).multiply(n1.subtract(1).max(0)))
-    .add(safeCov(c2, bandList).multiply(n2.subtract(1).max(0)))
-    .add(safeCov(c3, bandList).multiply(n3.subtract(1).max(0)))
-    .add(I.multiply(LAMBDA));
+    bands.map(
+      function(b) {
 
-  var invSw = Sw.matrixInverse();
+        return fc.aggregate_mean(
+          ee.String(b)
+        );
 
-  var w0 = invSw.matrixMultiply(mu0.subtract(mu3));
-  var w1 = invSw.matrixMultiply(mu1.subtract(mu3));
-  var w2 = invSw.matrixMultiply(mu2.subtract(mu3));
+      }
+    )
 
-  var W = ee.Array.cat([
-    w0.matrixTranspose(),
-    w1.matrixTranspose(),
-    w2.matrixTranspose()
-  ], 0);
-
-  return W;
-}
-
-function projectImageToFisher(img, W, bandList) {
-  var arr = img.select(bandList).toArray().toArray(1);
-  return ee.Image.constant(W).matrixMultiply(arr)
-    .arrayProject([0])
-    .arrayFlatten([['F1', 'F2', 'F3']]);
-}
-
-function projectFCToFisher(fc, bandList, W) {
-  fc = ee.FeatureCollection(fc);
-  bandList = ee.List(bandList);
-
-  return fc.map(function(f) {
-    var x = listToColArray(bandList.map(function(b) {
-      return f.get(ee.String(b));
-    }));
-    var z = W.matrixMultiply(x);
-    return f.set({
-      F1: z.get([0, 0]),
-      F2: z.get([1, 0]),
-      F3: z.get([2, 0])
-    });
-  });
-}
-
-function projectVectorToFisher(vecCol, W) {
-  return W.matrixMultiply(vecCol);
-}
-
-function colArrayToList3(colArr) {
-  return ee.List([
-    colArr.get([0, 0]),
-    colArr.get([1, 0]),
-    colArr.get([2, 0])
-  ]);
-}
-
-function refineEndmemberByKNN_FSR(sampledFC, fallbackVec, bandList, W, fallbackImg, fbGeom) {
-  sampledFC = ee.FeatureCollection(sampledFC);
-
-  var proj = projectFCToFisher(sampledFC, bandList, W);
-
-  var cF1 = ee.Number(proj.aggregate_mean('F1'));
-  var cF2 = ee.Number(proj.aggregate_mean('F2'));
-  var cF3 = ee.Number(proj.aggregate_mean('F3'));
-
-  var withDist = proj.map(function(f) {
-    var d = ee.Number(f.get('F1')).subtract(cF1).pow(2)
-      .add(ee.Number(f.get('F2')).subtract(cF2).pow(2))
-      .add(ee.Number(f.get('F3')).subtract(cF3).pow(2))
-      .sqrt();
-    return f.set('fDist', d);
-  });
-
-  var fsr = ee.Number(
-    withDist.reduceColumns(ee.Reducer.percentile([FSR_PCTL]), ['fDist'])
-      .get('p' + FSR_PCTL)
   );
-
-  var kept = withDist
-    .filter(ee.Filter.lte('fDist', fsr))
-    .sort('fDist')
-    .limit(KNN_K);
-
-  return ee.Array(ee.Algorithms.If(
-    kept.size().gt(0),
-    meanVectorFC(kept, bandList, fallbackImg, fbGeom),
-    fallbackVec
-  ));
 }
 
-function normAbund4(img4) {
-  var sum = img4.reduce(ee.Reducer.sum()).rename('UMX_sum');
-  var nrm = img4.divide(sum).where(sum.eq(0), 0)
-    .rename(['UMXn_Tree', 'UMXn_Grass', 'UMXn_Imperv', 'UMXn_Soil'])
-    .float();
-  return {nrm: nrm, sum: sum.float()};
-}
+function featureVector(
+  feature,
+  bands
+) {
 
-function reconRmseFT(endmemberList, fisherImg, abundImg4) {
-  var E = ee.Array(endmemberList).matrixTranspose();
-  var Eimg = ee.Image.constant(E);
-
-  var obs = fisherImg.toArray().toArray(1);
-  var ab = abundImg4.toArray().toArray(1);
-
-  var recon = Eimg.matrixMultiply(ab);
-  var resid = obs.subtract(recon);
-
-  return resid.multiply(resid)
-    .arrayReduce(ee.Reducer.mean(), [0])
-    .arrayProject([0])
-    .arrayFlatten([['UMX_RMSE']])
-    .sqrt()
-    .float();
-}
-
-
-function collapseTGIS4toTGO3(abund4) {
-  return ee.Image.cat([
-    abund4.select('UMXn_Tree').rename('Soft_Tree'),
-    abund4.select('UMXn_Grass').rename('Soft_Grass'),
-    abund4.select('UMXn_Imperv').add(abund4.select('UMXn_Soil')).rename('Soft_Other')
-  ]).float();
-}
-
-function toRF3Labels(fc) {
-  return ee.FeatureCollection(fc).map(function(f) {
-    var t = ee.Number(ee.Algorithms.If(f.get('TreeRatio'), f.get('TreeRatio'), 0));
-    var g = ee.Number(ee.Algorithms.If(f.get('GrassRatio'), f.get('GrassRatio'), 0));
-    var i = ee.Number(ee.Algorithms.If(f.get('ImpervRatio'), f.get('ImpervRatio'), 0));
-    var s = ee.Number(ee.Algorithms.If(f.get('SoilRatio'), f.get('SoilRatio'), 0));
-
-    var otherRaw = ee.Algorithms.If(
-      ee.Algorithms.IsEqual(f.get('OtherRatio'), null),
-      i.add(s),
-      f.get('OtherRatio')
+  feature =
+    ee.Feature(
+      feature
     );
-    var o = ee.Number(otherRaw);
 
-    return f.set({
-      TreeRatio: t,
-      GrassRatio: g,
-      OtherRatio: o
-    });
+  bands =
+    ee.List(
+      bands
+    );
+
+  return ee.Array(
+
+    bands.map(
+      function(b) {
+
+        return ee.Number(
+          feature.get(
+            ee.String(b)
+          )
+        );
+
+      }
+    )
+
+  );
+}
+
+function outerProduct(
+  vector,
+  p
+) {
+
+  vector =
+    ee.Array(
+      vector
+    );
+
+  var column =
+    vector.reshape(
+
+      ee.List([
+        p,
+        1
+      ])
+
+    );
+
+  return column.matrixMultiply(
+    column.matrixTranspose()
+  );
+}
+
+function classScatter(
+  fc,
+  bands,
+  meanVector
+) {
+
+  var p =
+    ee.Number(
+      ee.List(
+        bands
+      ).size()
+    );
+
+  var zero =
+    ee.Array.identity(
+      p
+    )
+    .multiply(0);
+
+  return ee.Array(
+
+    ee.FeatureCollection(fc)
+      .iterate(
+
+        function(item, accumulator) {
+
+          var f =
+            ee.Feature(
+              item
+            );
+
+          var acc =
+            ee.Array(
+              accumulator
+            );
+
+          var x =
+            featureVector(
+              f,
+              bands
+            );
+
+          var d =
+            x.subtract(
+              meanVector
+            );
+
+          return acc.add(
+
+            outerProduct(
+              d,
+              p
+            )
+
+          );
+
+        },
+
+        zero
+
+      )
+
+  );
+}
+function buildFisherProjection(
+  treeFC,
+  grassFC,
+  imperviousFC,
+  soilFC,
+  bands
+) {
+
+  bands =
+    ee.List(
+      bands
+    );
+
+  var p =
+    ee.Number(
+      bands.size()
+    );
+
+  var nT =
+    ee.Number(
+      treeFC.size()
+    );
+
+  var nG =
+    ee.Number(
+      grassFC.size()
+    );
+
+  var nI =
+    ee.Number(
+      imperviousFC.size()
+    );
+
+  var nS =
+    ee.Number(
+      soilFC.size()
+    );
+
+  var nAll =
+    nT
+      .add(nG)
+      .add(nI)
+      .add(nS);
+
+  var mT =
+    featureMeanVector(
+      treeFC,
+      bands
+    );
+
+  var mG =
+    featureMeanVector(
+      grassFC,
+      bands
+    );
+
+  var mI =
+    featureMeanVector(
+      imperviousFC,
+      bands
+    );
+
+  var mS =
+    featureMeanVector(
+      soilFC,
+      bands
+    );
+
+  var meanAll =
+    mT.multiply(nT)
+
+      .add(
+        mG.multiply(nG)
+      )
+
+      .add(
+        mI.multiply(nI)
+      )
+
+      .add(
+        mS.multiply(nS)
+      )
+
+      .divide(
+        nAll
+      );
+
+  var Sw =
+    classScatter(
+      treeFC,
+      bands,
+      mT
+    )
+
+    .add(
+      classScatter(
+        grassFC,
+        bands,
+        mG
+      )
+    )
+
+    .add(
+      classScatter(
+        imperviousFC,
+        bands,
+        mI
+      )
+    )
+
+    .add(
+      classScatter(
+        soilFC,
+        bands,
+        mS
+      )
+    )
+
+    .divide(
+      nAll.max(1)
+    );
+
+  var dT =
+    mT.subtract(
+      meanAll
+    );
+
+  var dG =
+    mG.subtract(
+      meanAll
+    );
+
+  var dI =
+    mI.subtract(
+      meanAll
+    );
+
+  var dS =
+    mS.subtract(
+      meanAll
+    );
+
+  var Sb =
+    outerProduct(
+      dT,
+      p
+    )
+    .multiply(
+      nT
+    )
+
+    .add(
+
+      outerProduct(
+        dG,
+        p
+      )
+      .multiply(
+        nG
+      )
+
+    )
+
+    .add(
+
+      outerProduct(
+        dI,
+        p
+      )
+      .multiply(
+        nI
+      )
+
+    )
+
+    .add(
+
+      outerProduct(
+        dS,
+        p
+      )
+      .multiply(
+        nS
+      )
+
+    )
+
+    .divide(
+      nAll.max(1)
+    );
+  var identity =
+    ee.Array.identity(
+      p
+    );
+
+  var SwReg =
+    Sw.add(
+
+      identity.multiply(
+        FISHER_REG
+      )
+
+    );
+  var swEigen =
+    SwReg.eigen();
+
+  var swValues =
+    swEigen.slice(
+      1,
+      0,
+      1
+    );
+
+  var swVectors =
+    swEigen.slice(
+      1,
+      1
+    );
+
+  var invSqrtValues =
+    swValues
+
+      .add(
+        1e-12
+      )
+
+      .pow(
+        -0.5
+      );
+
+  var DInvSqrt =
+    invSqrtValues
+      .matrixToDiag();
+
+  var W =
+    DInvSqrt
+      .matrixMultiply(
+        swVectors
+      );
+
+  var SbWhite =
+    W
+
+      .matrixMultiply(
+        Sb
+      )
+
+      .matrixMultiply(
+        W.matrixTranspose()
+      );
+
+  var fisherEigen =
+    SbWhite.eigen();
+
+  var fisherVectors =
+    fisherEigen.slice(
+      1,
+      1
+    );
+
+  var topVectors =
+    fisherVectors.slice(
+      0,
+      0,
+      FISHER_DIMS
+    );
+
+  var F =
+    topVectors.matrixMultiply(
+      W
+    );
+
+  return {
+
+    F:
+      F,
+
+    Sw:
+      Sw,
+
+    Sb:
+      Sb
+
+  };
+}
+
+function addFisherCoordinates(
+  fc,
+  F,
+  bands
+) {
+
+  var p =
+    ee.Number(
+      ee.List(
+        bands
+      ).size()
+    );
+
+  return ee.FeatureCollection(fc)
+
+    .map(
+      function(f) {
+
+        var x =
+          featureVector(
+            f,
+            bands
+          )
+          .reshape(
+
+            ee.List([
+              p,
+              1
+            ])
+
+          );
+
+        var y =
+          ee.Array(F)
+            .matrixMultiply(
+              x
+            );
+
+        return f.set({
+
+          F1:
+            y.get([
+              0,
+              0
+            ]),
+
+          F2:
+            y.get([
+              1,
+              0
+            ]),
+
+          F3:
+            y.get([
+              2,
+              0
+            ])
+
+        });
+
+      }
+    );
+}
+
+function fisherCoordinateStats(fc) {
+
+  var f1 =
+    ee.List(
+      fc.aggregate_array(
+        'F1'
+      )
+    );
+
+  var f2 =
+    ee.List(
+      fc.aggregate_array(
+        'F2'
+      )
+    );
+
+  var f3 =
+    ee.List(
+      fc.aggregate_array(
+        'F3'
+      )
+    );
+
+  return ee.Dictionary({
+
+    m1:
+      ee.Number(
+        f1.reduce(
+          ee.Reducer.mean()
+        )
+      ),
+
+    m2:
+      ee.Number(
+        f2.reduce(
+          ee.Reducer.mean()
+        )
+      ),
+
+    m3:
+      ee.Number(
+        f3.reduce(
+          ee.Reducer.mean()
+        )
+      ),
+
+    s1:
+      ee.Number(
+        f1.reduce(
+          ee.Reducer.stdDev()
+        )
+      ).max(
+        1e-9
+      ),
+
+    s2:
+      ee.Number(
+        f2.reduce(
+          ee.Reducer.stdDev()
+        )
+      ).max(
+        1e-9
+      ),
+
+    s3:
+      ee.Number(
+        f3.reduce(
+          ee.Reducer.stdDev()
+        )
+      ).max(
+        1e-9
+      )
+
   });
 }
 
-function assignSoftLabelsToMixed3(samplesFC, abund4img) {
-  var soft3img = collapseTGIS4toTGO3(abund4img);
-  var fc3 = toRF3Labels(samplesFC);
+function addStandardizedFisher(
+  fc,
+  stats
+) {
 
-  var tagged = fc3.map(function(f) {
-    var t = ee.Number(ee.Algorithms.If(f.get('TreeRatio'), f.get('TreeRatio'), 0));
-    var g = ee.Number(ee.Algorithms.If(f.get('GrassRatio'), f.get('GrassRatio'), 0));
-    var o = ee.Number(ee.Algorithms.If(f.get('OtherRatio'), f.get('OtherRatio'), 0));
-    var sum = t.add(g).add(o);
-
-    var isPure = ee.Algorithms.If(
-      t.eq(1),
-      true,
-      ee.Algorithms.If(g.eq(1), true, o.eq(1))
+  stats =
+    ee.Dictionary(
+      stats
     );
 
-    var isPure3 = ee.Algorithms.If(
-      isPure,
-      ee.Algorithms.If(sum.eq(1), 1, 0),
+  var m1 =
+    ee.Number(
+      stats.get(
+        'm1'
+      )
+    );
+
+  var m2 =
+    ee.Number(
+      stats.get(
+        'm2'
+      )
+    );
+
+  var m3 =
+    ee.Number(
+      stats.get(
+        'm3'
+      )
+    );
+
+  var s1 =
+    ee.Number(
+      stats.get(
+        's1'
+      )
+    );
+
+  var s2 =
+    ee.Number(
+      stats.get(
+        's2'
+      )
+    );
+
+  var s3 =
+    ee.Number(
+      stats.get(
+        's3'
+      )
+    );
+
+  return ee.FeatureCollection(fc)
+
+    .map(
+      function(f) {
+
+        return f.set({
+
+          Z1:
+            ee.Number(
+              f.get(
+                'F1'
+              )
+            )
+            .subtract(m1)
+            .divide(s1),
+
+          Z2:
+            ee.Number(
+              f.get(
+                'F2'
+              )
+            )
+            .subtract(m2)
+            .divide(s2),
+
+          Z3:
+            ee.Number(
+              f.get(
+                'F3'
+              )
+            )
+            .subtract(m3)
+            .divide(s3)
+
+        });
+
+      }
+    );
+}
+
+/***************************************************************
+ * MODULE 5: ENDMEMBER SELECTION AND UNCERTAINTY
+ ***************************************************************/
+
+function packLibrary(
+  fc,
+  bands
+) {
+
+  fc =
+    ee.FeatureCollection(fc);
+
+  bands =
+    ee.List(
+      bands
+    );
+
+  var size =
+    fc.size();
+
+  var z1 =
+    fc.aggregate_array(
+      'Z1'
+    );
+
+  var z2 =
+    fc.aggregate_array(
+      'Z2'
+    );
+
+  var z3 =
+    fc.aggregate_array(
+      'Z3'
+    );
+
+  var bandDict =
+    ee.Dictionary(
+      bands.iterate(
+
+        function(b, accumulator) {
+
+          accumulator =
+            ee.Dictionary(
+              accumulator
+            );
+
+          b =
+            ee.String(
+              b
+            );
+
+          return accumulator.set(
+
+            b,
+
+            fc.aggregate_array(
+              b
+            )
+
+          );
+
+        },
+
+        ee.Dictionary({})
+
+      )
+    );
+
+  return ee.Dictionary({
+
+    size:
+      size,
+
+    z1:
+      z1,
+
+    z2:
+      z2,
+
+    z3:
+      z3,
+
+    bands:
+      bandDict
+
+  });
+}
+
+function packedKNN(
+  mixedFeature,
+  packed
+) {
+
+  mixedFeature =
+    ee.Feature(
+      mixedFeature
+    );
+
+  packed =
+    ee.Dictionary(
+      packed
+    );
+
+  var n =
+    ee.Number(
+      packed.get(
+        'size'
+      )
+    );
+
+  var z1List =
+    ee.List(
+      packed.get(
+        'z1'
+      )
+    );
+
+  var z2List =
+    ee.List(
+      packed.get(
+        'z2'
+      )
+    );
+
+  var z3List =
+    ee.List(
+      packed.get(
+        'z3'
+      )
+    );
+
+  var q1 =
+    ee.Number(
+      mixedFeature.get(
+        'Z1'
+      )
+    );
+
+  var q2 =
+    ee.Number(
+      mixedFeature.get(
+        'Z2'
+      )
+    );
+
+  var q3 =
+    ee.Number(
+      mixedFeature.get(
+        'Z3'
+      )
+    );
+
+  var indices =
+    ee.List.sequence(
+      0,
+      n.subtract(1)
+    );
+
+  var distances =
+    indices.map(
+      function(index) {
+
+        index =
+          ee.Number(
+            index
+          );
+
+        var d1 =
+          ee.Number(
+            z1List.get(index)
+          )
+          .subtract(q1);
+
+        var d2 =
+          ee.Number(
+            z2List.get(index)
+          )
+          .subtract(q2);
+
+        var d3 =
+          ee.Number(
+            z3List.get(index)
+          )
+          .subtract(q3);
+
+        return d1.pow(2)
+
+          .add(
+            d2.pow(2)
+          )
+
+          .add(
+            d3.pow(2)
+          )
+
+          .sqrt();
+
+      }
+    );
+
+  var validIndices =
+    indices
+
+      .map(
+        function(index) {
+
+          index =
+            ee.Number(index);
+
+          var distance =
+            ee.Number(
+              distances.get(index)
+            );
+
+          return ee.Algorithms.If(
+
+            distance.lte(
+              KNN_RADIUS
+            ),
+
+            index,
+
+            null
+
+          );
+
+        }
+      )
+
+      .removeAll([
+        null
+      ]);
+
+  var validDistances =
+    validIndices.map(
+      function(index) {
+
+        return distances.get(
+          ee.Number(index)
+        );
+
+      }
+    );
+
+  var sorted =
+    validIndices.sort(
+      validDistances
+    );
+
+  var topK =
+    sorted.slice(
+      0,
+      KNN_K
+    );
+
+  return ee.Dictionary({
+
+    indices:
+      topK,
+
+    radiusCount:
+      validIndices.size(),
+
+    distances:
+      distances
+
+  });
+}
+
+function localEndmemberFromPacked(
+  packed,
+  indices,
+  bands
+) {
+
+  packed =
+    ee.Dictionary(
+      packed
+    );
+
+  indices =
+    ee.List(
+      indices
+    );
+
+  bands =
+    ee.List(
+      bands
+    );
+
+  var bandDict =
+    ee.Dictionary(
+      packed.get(
+        'bands'
+      )
+    );
+
+  var vector =
+    bands.map(
+      function(b) {
+
+        b =
+          ee.String(
+            b
+          );
+
+        var source =
+          ee.List(
+            bandDict.get(
+              b
+            )
+          );
+
+        var selected =
+          indices.map(
+            function(index) {
+
+              return source.get(
+                ee.Number(index)
+              );
+
+            }
+          );
+
+        return ee.Number(
+          selected.reduce(
+            ee.Reducer.mean()
+          )
+        );
+
+      }
+    );
+
+  return ee.Array(
+    vector
+  );
+}
+
+function globalPackedMean(
+  packed,
+  bands
+) {
+
+  packed =
+    ee.Dictionary(
+      packed
+    );
+
+  bands =
+    ee.List(
+      bands
+    );
+
+  var bandDict =
+    ee.Dictionary(
+      packed.get(
+        'bands'
+      )
+    );
+
+  return ee.Array(
+
+    bands.map(
+      function(b) {
+
+        return ee.Number(
+
+          ee.List(
+            bandDict.get(
+              ee.String(b)
+            )
+          )
+          .reduce(
+            ee.Reducer.mean()
+          )
+
+        );
+
+      }
+    )
+
+  );
+}
+
+function safeLocalEndmember(
+  packed,
+  knnResult,
+  bands
+) {
+
+  packed =
+    ee.Dictionary(
+      packed
+    );
+
+  knnResult =
+    ee.Dictionary(
+      knnResult
+    );
+
+  var indices =
+    ee.List(
+      knnResult.get(
+        'indices'
+      )
+    );
+
+  var local =
+    ee.Array(
+      ee.Algorithms.If(
+
+        indices.size().gt(0),
+
+        localEndmemberFromPacked(
+          packed,
+          indices,
+          bands
+        ),
+
+        globalPackedMean(
+          packed,
+          bands
+        )
+
+      )
+    );
+
+  return local;
+}
+
+function packedDispersion(
+  packed,
+  indices
+) {
+
+  packed =
+    ee.Dictionary(
+      packed
+    );
+
+  indices =
+    ee.List(
+      indices
+    );
+
+  var z1 =
+    ee.List(
+      packed.get(
+        'z1'
+      )
+    );
+
+  var z2 =
+    ee.List(
+      packed.get(
+        'z2'
+      )
+    );
+
+  var z3 =
+    ee.List(
+      packed.get(
+        'z3'
+      )
+    );
+
+  var selected1 =
+    indices.map(
+      function(i) {
+
+        return z1.get(
+          ee.Number(i)
+        );
+
+      }
+    );
+
+  var selected2 =
+    indices.map(
+      function(i) {
+
+        return z2.get(
+          ee.Number(i)
+        );
+
+      }
+    );
+
+  var selected3 =
+    indices.map(
+      function(i) {
+
+        return z3.get(
+          ee.Number(i)
+        );
+
+      }
+    );
+
+  var result =
+    ee.Number(
+      ee.Algorithms.If(
+
+        indices.size().gt(1),
+
+        (function() {
+
+          var m1 =
+            ee.Number(
+              selected1.reduce(
+                ee.Reducer.mean()
+              )
+            );
+
+          var m2 =
+            ee.Number(
+              selected2.reduce(
+                ee.Reducer.mean()
+              )
+            );
+
+          var m3 =
+            ee.Number(
+              selected3.reduce(
+                ee.Reducer.mean()
+              )
+            );
+
+          var squared =
+            ee.List.sequence(
+              0,
+              indices.size().subtract(1)
+            )
+            .map(
+              function(k) {
+
+                k =
+                  ee.Number(
+                    k
+                  );
+
+                var d1 =
+                  ee.Number(
+                    selected1.get(k)
+                  )
+                  .subtract(m1);
+
+                var d2 =
+                  ee.Number(
+                    selected2.get(k)
+                  )
+                  .subtract(m2);
+
+                var d3 =
+                  ee.Number(
+                    selected3.get(k)
+                  )
+                  .subtract(m3);
+
+                return d1.pow(2)
+                  .add(
+                    d2.pow(2)
+                  )
+                  .add(
+                    d3.pow(2)
+                  );
+
+              }
+            );
+
+          return ee.Number(
+            squared.reduce(
+              ee.Reducer.mean()
+            )
+          ).sqrt();
+
+        })(),
+
+        999
+
+      )
+    );
+
+  return result;
+}
+
+/***************************************************************
+ * MODULE 6: PSEUDO-LABEL GENERATION
+ ***************************************************************/
+
+var FCLS_SUBSETS = [
+
+  [0],
+  [1],
+  [2],
+  [3],
+
+  [0,1],
+  [0,2],
+  [0,3],
+  [1,2],
+  [1,3],
+  [2,3],
+
+  [0,1,2],
+  [0,1,3],
+  [0,2,3],
+  [1,2,3],
+
+  [0,1,2,3]
+
+];
+
+function fclsCandidate(
+  E,
+  y,
+  subset
+) {
+
+  var m =
+    subset.length;
+
+  var columns =
+    [];
+
+  for (
+    var i = 0;
+    i < m;
+    i++
+  ) {
+
+    columns.push(
+
+      E.slice(
+        1,
+        subset[i],
+        subset[i] + 1
+      )
+
+    );
+
+  }
+
+  var Es =
+    ee.Array.cat(
+      columns,
+      1
+    );
+
+  var ET =
+    Es.matrixTranspose();
+
+  var H =
+    ET
+
+      .matrixMultiply(
+        Es
+      )
+
+      .multiply(2)
+
+      .add(
+
+        ee.Array.identity(
+          m
+        )
+        .multiply(
+          FCLS_RIDGE
+        )
+
+      );
+
+  var ones =
+    [];
+
+  for (
+    var j = 0;
+    j < m;
+    j++
+  ) {
+
+    ones.push([
+      1
+    ]);
+
+  }
+
+  var oneCol =
+    ee.Array(
+      ones
+    );
+
+  var oneRow =
+    oneCol.matrixTranspose();
+
+  var top =
+    ee.Array.cat(
+      [
+        H,
+        oneCol
+      ],
+      1
+    );
+
+  var bottom =
+    ee.Array.cat(
+      [
+
+        oneRow,
+
+        ee.Array([
+          [0]
+        ])
+
+      ],
+      1
+    );
+
+  var KKT =
+    ee.Array.cat(
+      [
+        top,
+        bottom
+      ],
       0
     );
 
-    return f.set('isPure3', isPure3);
+  var rhsTop =
+    ET
+
+      .matrixMultiply(
+        y
+      )
+
+      .multiply(2);
+
+  var rhs =
+    ee.Array.cat(
+      [
+
+        rhsTop,
+
+        ee.Array([
+          [1]
+        ])
+
+      ],
+      0
+    );
+
+  var solution =
+    KKT
+
+      .matrixInverse()
+
+      .matrixMultiply(
+        rhs
+      );
+
+  var fSmall =
+    solution.slice(
+      0,
+      0,
+      m
+    );
+
+  var fullValues =
+    [];
+
+  for (
+    var k = 0;
+    k < 4;
+    k++
+  ) {
+
+    var position =
+      subset.indexOf(
+        k
+      );
+
+    if (
+      position >= 0
+    ) {
+
+      fullValues.push(
+
+        ee.Number(
+          fSmall.get([
+            position,
+            0
+          ])
+        )
+
+      );
+
+    }
+
+    else {
+
+      fullValues.push(
+        ee.Number(0)
+      );
+
+    }
+
+  }
+
+  var valid =
+    ee.Number(1);
+
+  for (
+    var q = 0;
+    q < 4;
+    q++
+  ) {
+
+    valid =
+      valid.multiply(
+
+        ee.Number(
+          ee.Algorithms.If(
+
+            ee.Number(
+              fullValues[q]
+            )
+            .gte(
+              -1e-8
+            ),
+
+            1,
+
+            0
+
+          )
+        )
+
+      );
+
+  }
+
+  var positive =
+    [];
+
+  var sum =
+    ee.Number(0);
+
+  for (
+    var h = 0;
+    h < 4;
+    h++
+  ) {
+
+    var value =
+      ee.Number(
+        fullValues[h]
+      )
+      .max(0);
+
+    positive.push(
+      value
+    );
+
+    sum =
+      sum.add(
+        value
+      );
+
+  }
+
+  var rows =
+    [];
+
+  for (
+    var z = 0;
+    z < 4;
+    z++
+  ) {
+
+    rows.push([
+
+      ee.Number(
+        positive[z]
+      )
+      .divide(
+        sum.max(
+          1e-12
+        )
+      )
+
+    ]);
+
+  }
+
+  var fractions =
+    ee.Array(
+      rows
+    );
+
+  var residual =
+    y.subtract(
+
+      E.matrixMultiply(
+        fractions
+      )
+
+    );
+
+  var sse =
+    ee.Number(
+
+      residual
+
+        .matrixTranspose()
+
+        .matrixMultiply(
+          residual
+        )
+
+        .get([
+          0,
+          0
+        ])
+
+    );
+
+  return ee.Dictionary({
+
+    valid:
+      valid,
+
+    sse:
+      sse,
+
+    fractions:
+      fractions
+
   });
+}
 
-  var pure = tagged.filter(ee.Filter.eq('isPure3', 1));
-  var mixed = tagged.filter(ee.Filter.eq('isPure3', 0));
+function fclsSolve(
+  E,
+  y
+) {
 
-  var mixedSoft = soft3img.sampleRegions({
-    collection: mixed,
-    scale: 10,
-    geometries: true
-  }).map(function(f) {
-    return f.set({
-      TreeRatio: f.get('Soft_Tree'),
-      GrassRatio: f.get('Soft_Grass'),
-      OtherRatio: f.get('Soft_Other')
+  E =
+    ee.Array(E);
+
+  y =
+    ee.Array(y);
+
+  var candidates =
+    [];
+
+  for (
+    var i = 0;
+    i < FCLS_SUBSETS.length;
+    i++
+  ) {
+
+    candidates.push(
+
+      fclsCandidate(
+
+        E,
+
+        y,
+
+        FCLS_SUBSETS[i]
+
+      )
+
+    );
+
+  }
+
+  var initial =
+    ee.Dictionary({
+
+      valid:
+        0,
+
+      sse:
+        1e30,
+
+      fractions:
+        ee.Array([
+          [0],
+          [0],
+          [0],
+          [0]
+        ])
+
     });
-  });
 
-  return pure.merge(mixedSoft);
+  return ee.Dictionary(
+
+    ee.List(
+      candidates
+    )
+    .iterate(
+
+      function(item, previous) {
+
+        var current =
+          ee.Dictionary(
+            item
+          );
+
+        var best =
+          ee.Dictionary(
+            previous
+          );
+
+        var valid =
+          ee.Number(
+            current.get(
+              'valid'
+            )
+          );
+
+        var better =
+          ee.Number(
+            current.get(
+              'sse'
+            )
+          )
+          .lt(
+            ee.Number(
+              best.get(
+                'sse'
+              )
+            )
+          );
+
+        var choose =
+          valid.multiply(
+
+            ee.Number(
+              ee.Algorithms.If(
+
+                better,
+
+                1,
+
+                0
+
+              )
+            )
+
+          );
+
+        return ee.Algorithms.If(
+
+          choose.eq(1),
+
+          current,
+
+          best
+
+        );
+
+      },
+
+      initial
+
+    )
+
+  );
 }
 
-function addHardClassFromRatios(fc) {
-  return ee.FeatureCollection(fc).map(function(f) {
-    var t = ee.Number(ee.Algorithms.If(f.get('TreeRatio'), f.get('TreeRatio'), 0));
-    var g = ee.Number(ee.Algorithms.If(f.get('GrassRatio'), f.get('GrassRatio'), 0));
-    var o = ee.Number(ee.Algorithms.If(f.get('OtherRatio'), f.get('OtherRatio'), 0));
+function localizedPseudoLabel(
+  feature,
+  treePack,
+  grassPack,
+  imperviousPack,
+  soilPack,
+  F
+) {
 
-    var maxV = ee.Number(ee.List([t, g, o]).reduce(ee.Reducer.max()));
+  feature =
+    ee.Feature(
+      feature
+    );
 
-    var cls = ee.Number(ee.Algorithms.If(
-      t.eq(maxV), 0,
-      ee.Algorithms.If(g.eq(maxV), 1, 2)
-    ));
+  var tKNN =
+    packedKNN(
+      feature,
+      treePack
+    );
 
-    return f.set({
-      cls: cls,
-      label_conf: maxV
-    });
+  var gKNN =
+    packedKNN(
+      feature,
+      grassPack
+    );
+
+  var iKNN =
+    packedKNN(
+      feature,
+      imperviousPack
+    );
+
+  var sKNN =
+    packedKNN(
+      feature,
+      soilPack
+    );
+
+  var nT =
+    ee.Number(
+      tKNN.get(
+        'radiusCount'
+      )
+    );
+
+  var nG =
+    ee.Number(
+      gKNN.get(
+        'radiusCount'
+      )
+    );
+
+  var nI =
+    ee.Number(
+      iKNN.get(
+        'radiusCount'
+      )
+    );
+
+  var nS =
+    ee.Number(
+      sKNN.get(
+        'radiusCount'
+      )
+    );
+
+  var valid =
+    ee.Number(
+      ee.Algorithms.If(
+        nT.gte(
+          KNN_MIN
+        ),
+        1,
+        0
+      )
+    )
+
+    .multiply(
+
+      ee.Number(
+        ee.Algorithms.If(
+          nG.gte(
+            KNN_MIN
+          ),
+          1,
+          0
+        )
+      )
+
+    )
+
+    .multiply(
+
+      ee.Number(
+        ee.Algorithms.If(
+          nI.gte(
+            KNN_MIN
+          ),
+          1,
+          0
+        )
+      )
+
+    )
+
+    .multiply(
+
+      ee.Number(
+        ee.Algorithms.If(
+          nS.gte(
+            KNN_MIN
+          ),
+          1,
+          0
+        )
+      )
+
+    );
+
+  var p =
+    ee.Number(
+      ee.List(
+        FISHER_BANDS
+      ).size()
+    );
+
+  var tEnd =
+    safeLocalEndmember(
+      treePack,
+      tKNN,
+      FISHER_BANDS
+    )
+    .reshape(
+      ee.List([
+        p,
+        1
+      ])
+    );
+
+  var gEnd =
+    safeLocalEndmember(
+      grassPack,
+      gKNN,
+      FISHER_BANDS
+    )
+    .reshape(
+      ee.List([
+        p,
+        1
+      ])
+    );
+
+  var iEnd =
+    safeLocalEndmember(
+      imperviousPack,
+      iKNN,
+      FISHER_BANDS
+    )
+    .reshape(
+      ee.List([
+        p,
+        1
+      ])
+    );
+
+  var sEnd =
+    safeLocalEndmember(
+      soilPack,
+      sKNN,
+      FISHER_BANDS
+    )
+    .reshape(
+      ee.List([
+        p,
+        1
+      ])
+    );
+
+  var EOriginal =
+    ee.Array.cat(
+      [
+
+        tEnd,
+        gEnd,
+        iEnd,
+        sEnd
+
+      ],
+      1
+    );
+
+  var EFisher =
+    ee.Array(F)
+      .matrixMultiply(
+        EOriginal
+      );
+
+  var y =
+    ee.Array([
+
+      [
+        ee.Number(
+          feature.get(
+            'F1'
+          )
+        )
+      ],
+
+      [
+        ee.Number(
+          feature.get(
+            'F2'
+          )
+        )
+      ],
+
+      [
+        ee.Number(
+          feature.get(
+            'F3'
+          )
+        )
+      ]
+
+    ]);
+
+  var solution =
+    fclsSolve(
+      EFisher,
+      y
+    );
+
+  var fractions =
+    ee.Array(
+      solution.get(
+        'fractions'
+      )
+    );
+
+  var tree =
+    ee.Number(
+      fractions.get([
+        0,
+        0
+      ])
+    );
+
+  var grass =
+    ee.Number(
+      fractions.get([
+        1,
+        0
+      ])
+    );
+
+  var impervious =
+    ee.Number(
+      fractions.get([
+        2,
+        0
+      ])
+    );
+
+  var soil =
+    ee.Number(
+      fractions.get([
+        3,
+        0
+      ])
+    );
+
+  var other =
+    impervious.add(
+      soil
+    );
+
+  var rmse =
+    ee.Number(
+      solution.get(
+        'sse'
+      )
+    )
+    .divide(
+      FISHER_DIMS
+    )
+    .sqrt();
+
+  var uTree =
+    packedDispersion(
+
+      treePack,
+
+      ee.Dictionary(
+        tKNN
+      ).get(
+        'indices'
+      )
+
+    );
+
+  var uGrass =
+    packedDispersion(
+
+      grassPack,
+
+      ee.Dictionary(
+        gKNN
+      ).get(
+        'indices'
+      )
+
+    );
+
+  var uImp =
+    packedDispersion(
+
+      imperviousPack,
+
+      ee.Dictionary(
+        iKNN
+      ).get(
+        'indices'
+      )
+
+    );
+
+  var uSoil =
+    packedDispersion(
+
+      soilPack,
+
+      ee.Dictionary(
+        sKNN
+      ).get(
+        'indices'
+      )
+
+    );
+
+  var uncertainty =
+    uTree
+      .add(uGrass)
+      .add(uImp)
+      .add(uSoil)
+      .divide(4);
+
+  return feature.set({
+
+    TreeRatio:
+      tree,
+
+    GrassRatio:
+      grass,
+
+    ImperviousRatio:
+      impervious,
+
+    SoilRatio:
+      soil,
+
+    OtherRatio:
+      other,
+
+    Fisher_RMSE:
+      rmse,
+
+    EndmemberUncertainty:
+      uncertainty,
+
+    nTreeNN:
+      nT,
+
+    nGrassNN:
+      nG,
+
+    nImperviousNN:
+      nI,
+
+    nSoilNN:
+      nS,
+
+    pseudo_valid:
+      valid,
+
+    sample_type:
+      'mixed_local_fisher'
+
   });
 }
 
-/********************* 导出 *********************/
-function exportToDrive(image, description, fileNamePrefix, region) {
-  var out = image.clamp(0, 1).toFloat();
-  Export.image.toDrive({
-    image: out,
-    description: description,
-    folder: DRIVE_FOLDER,
-    fileNamePrefix: fileNamePrefix,
-    region: region,
-    scale: 10,
-    maxPixels: 1e13,
-    fileFormat: 'GeoTIFF',
-    formatOptions: {cloudOptimized: true}
-  });
-}
+/***************************************************************
+ * MODULE 7: PREDICTOR CONSTRUCTION
+ ***************************************************************/
 
-/********************* 主流程 *********************/
-function runAnalysis(region, cityName, endmemberSamples4, rfSamplesRaw3orMixed, trainBufferMeters) {
-  var TRAIN_BUF_LOCAL = trainBufferMeters || TRAIN_BUF;
-  var trainAOI = rfSamplesRaw3orMixed.geometry().buffer(TRAIN_BUF_LOCAL);
+function runAnalysis(
+  region,
+  cityName,
+  pureTree,
+  pureGrass,
+  pureImpervious,
+  pureSoil,
+  mixedPoints,
+  manualSamples
+) {
+
+  var allGeometry =
+    pureTree
+      .merge(
+        pureGrass
+      )
+      .merge(
+        pureImpervious
+      )
+      .merge(
+        pureSoil
+      )
+      .merge(
+        mixedPoints
+      )
+      .merge(
+        manualSamples
+      );
+
+  var trainAOI =
+    allGeometry
+      .geometry()
+      .buffer(
+        TRAIN_BUF
+      );
 
   var S2_BANDS_ALL = [
-    'B2','B3','B4','B5','B6','B7','B8','B8A','B11','B12',
-    'NDVI','EVI','GCI','SAVI','NDBI','NDWI'
+
+    'B2',
+    'B3',
+    'B4',
+    'B5',
+    'B6',
+    'B7',
+    'B8',
+    'B8A',
+    'B11',
+    'B12',
+
+    'NDVI',
+    'EVI',
+    'GCI',
+    'SAVI',
+    'NDBI',
+    'NDWI'
+
   ];
 
-  var statsReducer = ee.Reducer.mean()
-    .combine(ee.Reducer.min(), '', true)
-    .combine(ee.Reducer.max(), '', true)
-    .combine(ee.Reducer.stdDev(), '', true)
-    .combine(ee.Reducer.percentile([25,50,75], ['p25','p50','p75']), '', true);
+  var reducer =
+    ee.Reducer.mean()
 
-  var s2_city = s2Collection(region, YEAR, MONTHS);
-  var s2idx_city = s2_city.map(addIndices);
-  var base_city = s2idx_city.select(S2_BANDS_ALL).reduce(statsReducer).clip(region).unmask(-9999);
-  var s2core_city = s2_city.select(UNMIX_BANDS).median().clip(region).unmask(-9999);
+      .combine(
+        ee.Reducer.min(),
+        '',
+        true
+      )
 
-  var s2_train = s2Collection(trainAOI, YEAR, MONTHS);
-  var s2idx_train = s2_train.map(addIndices);
-  var base_train = s2idx_train.select(S2_BANDS_ALL).reduce(statsReducer).clip(trainAOI).unmask(-9999);
-  var s2core_train = s2_train.select(UNMIX_BANDS).median().clip(trainAOI).unmask(-9999);
+      .combine(
+        ee.Reducer.max(),
+        '',
+        true
+      )
 
-  var s1_city = ee.ImageCollection('COPERNICUS/S1_GRD')
-    .filterBounds(region)
-    .filterDate(
-      ee.Date.fromYMD(YEAR, MONTHS[0], 1),
-      ee.Date.fromYMD(YEAR, MONTHS[1], 1).advance(1, 'month')
-    )
-    .filter(ee.Filter.eq('instrumentMode', 'IW'))
-    .filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING'))
-    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
-    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'));
-  var vv_city = s1_city.select('VV').median().rename('VV_median');
-  var vh_city = s1_city.select('VH').median().rename('VH_median');
+      .combine(
+        ee.Reducer.stdDev(),
+        '',
+        true
+      )
 
-  var s1_train = ee.ImageCollection('COPERNICUS/S1_GRD')
-    .filterBounds(trainAOI)
-    .filterDate(
-      ee.Date.fromYMD(YEAR, MONTHS[0], 1),
-      ee.Date.fromYMD(YEAR, MONTHS[1], 1).advance(1, 'month')
-    )
-    .filter(ee.Filter.eq('instrumentMode', 'IW'))
-    .filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING'))
-    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
-    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'));
-  var vv_train = s1_train.select('VV').median().rename('VV_median');
-  var vh_train = s1_train.select('VH').median().rename('VH_median');
+      .combine(
 
-  var dem = ee.Image('USGS/SRTMGL1_003').unmask(0);
-  var elevation = dem.rename('elevation');
-  var slope = ee.Terrain.slope(dem).rename('slope');
-  var aspect = ee.Terrain.aspect(dem).rename('aspect');
+        ee.Reducer.percentile(
+          [25,50,75],
+          [
+            'p25',
+            'p50',
+            'p75'
+          ]
+        ),
 
-  var samplesCity = endmemberSamples4.filterBounds(region);
+        '',
+        true
 
-  var treePureCity = samplesCity.filter(ee.Filter.eq('TreeRatio', 1));
-  var grassPureCity = samplesCity.filter(ee.Filter.eq('GrassRatio', 1));
-  var impervPureCity = samplesCity.filter(ee.Filter.eq('ImpervRatio', 1));
-  var soilPureCity = samplesCity.filter(ee.Filter.eq('SoilRatio', 1));
+      );
 
-  function sampleForEM(imgCore, fc, cls) {
-    return imgCore.sampleRegions({
-      collection: fc,
-      scale: 10,
-      geometries: false
-    })
-    .filter(ee.Filter.neq(UNMIX_BANDS[0], -9999))
-    .map(function(f) { return f.set('cls', cls); });
+  var s2City =
+    s2Collection(
+      region,
+      YEAR,
+      MONTHS
+    );
+
+  var baseCity =
+    s2City
+      .map(
+        addIndices
+      )
+      .select(
+        S2_BANDS_ALL
+      )
+      .reduce(
+        reducer
+      )
+      .clip(
+        region
+      )
+      .unmask(
+        -9999
+      );
+
+  var fisherCity =
+    s2City
+      .select(
+        FISHER_BANDS
+      )
+      .median()
+      .multiply(
+        0.0001
+      )
+      .clip(
+        region
+      );
+
+  var s2Train =
+    s2Collection(
+      trainAOI,
+      YEAR,
+      MONTHS
+    );
+
+  var baseTrain =
+    s2Train
+      .map(
+        addIndices
+      )
+      .select(
+        S2_BANDS_ALL
+      )
+      .reduce(
+        reducer
+      )
+      .clip(
+        trainAOI
+      )
+      .unmask(
+        -9999
+      );
+
+  var fisherTrain =
+    s2Train
+      .select(
+        FISHER_BANDS
+      )
+      .median()
+      .multiply(
+        0.0001
+      )
+      .clip(
+        trainAOI
+      );
+
+  var d0 =
+    ee.Date.fromYMD(
+      YEAR,
+      1,
+      1
+    );
+
+  var d1 =
+    ee.Date.fromYMD(
+      YEAR,
+      12,
+      1
+    ).advance(
+      1,
+      'month'
+    );
+
+  function getS1(regionX) {
+
+    return ee.ImageCollection(
+        'COPERNICUS/S1_GRD'
+      )
+
+      .filterBounds(
+        regionX
+      )
+
+      .filterDate(
+        d0,
+        d1
+      )
+
+      .filter(
+        ee.Filter.eq(
+          'instrumentMode',
+          'IW'
+        )
+      )
+
+      .filter(
+        ee.Filter.eq(
+          'orbitProperties_pass',
+          'DESCENDING'
+        )
+      )
+
+      .filter(
+        ee.Filter.listContains(
+          'transmitterReceiverPolarisation',
+          'VV'
+        )
+      )
+
+      .filter(
+        ee.Filter.listContains(
+          'transmitterReceiverPolarisation',
+          'VH'
+        )
+      );
   }
 
-  var tS0 = sampleForEM(s2core_city, treePureCity, 0);
-  var gS0 = sampleForEM(s2core_city, grassPureCity, 1);
-  var iS0 = sampleForEM(s2core_city, impervPureCity, 2);
-  var sS0 = sampleForEM(s2core_city, soilPureCity, 3);
+  var s1City =
+    getS1(
+      region
+    );
 
-  var pureSampled0 = tS0.merge(gS0).merge(iS0).merge(sS0);
+  var vvCity =
+    s1City
+      .select(
+        'VV'
+      )
+      .median()
+      .rename(
+        'VV_median'
+      )
+      .unmask(
+        -9999
+      );
 
-  var tEnd0 = meanVectorFC(tS0, UNMIX_BANDS, s2core_city, region);
-  var gEnd0 = meanVectorFC(gS0, UNMIX_BANDS, s2core_city, region);
-  var iEnd0 = meanVectorFC(iS0, UNMIX_BANDS, s2core_city, region);
-  var sEnd0 = meanVectorFC(sS0, UNMIX_BANDS, s2core_city, region);
+  var vhCity =
+    s1City
+      .select(
+        'VH'
+      )
+      .median()
+      .rename(
+        'VH_median'
+      )
+      .unmask(
+        -9999
+      );
 
-  var Wf = buildFisherTransform(pureSampled0, UNMIX_BANDS, s2core_city, region);
+  var s1Train =
+    getS1(
+      trainAOI
+    );
 
-  var tEnd = refineEndmemberByKNN_FSR(tS0, tEnd0, UNMIX_BANDS, Wf, s2core_city, region);
-  var gEnd = refineEndmemberByKNN_FSR(gS0, gEnd0, UNMIX_BANDS, Wf, s2core_city, region);
-  var iEnd = refineEndmemberByKNN_FSR(iS0, iEnd0, UNMIX_BANDS, Wf, s2core_city, region);
-  var sEnd = refineEndmemberByKNN_FSR(sS0, sEnd0, UNMIX_BANDS, Wf, s2core_city, region);
+  var vvTrain =
+    s1Train
+      .select(
+        'VV'
+      )
+      .median()
+      .rename(
+        'VV_median'
+      )
+      .unmask(
+        -9999
+      );
 
-  var tEndF = projectVectorToFisher(tEnd, Wf);
-  var gEndF = projectVectorToFisher(gEnd, Wf);
-  var iEndF = projectVectorToFisher(iEnd, Wf);
-  var sEndF = projectVectorToFisher(sEnd, Wf);
+  var vhTrain =
+    s1Train
+      .select(
+        'VH'
+      )
+      .median()
+      .rename(
+        'VH_median'
+      )
+      .unmask(
+        -9999
+      );
 
-  var endmembersFisher = ee.List([
-    colArrayToList3(tEndF),
-    colArrayToList3(gEndF),
-    colArrayToList3(iEndF),
-    colArrayToList3(sEndF)
-  ]);
+  var dem =
+    ee.Image(
+      'USGS/SRTMGL1_003'
+    )
+    .unmask(0);
 
-  var fisher_city = projectImageToFisher(s2core_city, Wf, UNMIX_BANDS);
-  var fisher_train = projectImageToFisher(s2core_train, Wf, UNMIX_BANDS);
+  var elevation =
+    dem.rename(
+      'elevation'
+    );
 
-  var umx_city_img = fisher_city.unmix(endmembersFisher, true, true)
-    .rename(['UMX_Tree','UMX_Grass','UMX_Imperv','UMX_Soil'])
-    .clamp(0, 1);
+  var slope =
+    ee.Terrain
+      .slope(
+        dem
+      )
+      .rename(
+        'slope'
+      );
 
-  var umx_train_img = fisher_train.unmix(endmembersFisher, true, true)
-    .rename(['UMX_Tree','UMX_Grass','UMX_Imperv','UMX_Soil'])
-    .clamp(0, 1);
+  var aspect =
+    ee.Terrain
+      .aspect(
+        dem
+      )
+      .rename(
+        'aspect'
+      );
 
-  var nCity = normAbund4(umx_city_img);
-  var nTrain = normAbund4(umx_train_img);
+  var featureCity =
+    baseCity
+      .addBands([
+        vhCity,
+        vvCity,
+        elevation,
+        slope,
+        aspect
+      ])
+      .clip(
+        region
+      );
 
-  var rmse_city = reconRmseFT(endmembersFisher, fisher_city, umx_city_img);
-  var rmse_train = reconRmseFT(endmembersFisher, fisher_train, umx_train_img);
+  var featureTrain =
+    baseTrain
+      .addBands([
+        vhTrain,
+        vvTrain,
+        elevation,
+        slope,
+        aspect
+      ])
+      .clip(
+        trainAOI
+      );
 
-  var soft3_city = collapseTGIS4toTGO3(nCity.nrm);
-  var soft3_train = collapseTGIS4toTGO3(nTrain.nrm);
+  var allBands =
+    featureCity
+      .bandNames();
 
-  var rfSamplesAll3 = assignSoftLabelsToMixed3(rfSamplesRaw3orMixed, nCity.nrm);
+  var treeLib =
+    fisherCity.sampleRegions({
 
-  var feature_city_base = base_city.addBands([vh_city, vv_city, aspect, elevation, slope]).clip(region);
-  var feature_train_base = base_train.addBands([vh_train, vv_train, aspect, elevation, slope]).clip(trainAOI);
+      collection:
+        pureTree,
 
-  var feature_city = feature_city_base
-    .addBands([nCity.nrm, soft3_city, nCity.sum, rmse_city])
-    .clip(region);
+      scale:
+        SCALE,
 
-  var feature_train = feature_train_base
-    .addBands([nTrain.nrm, soft3_train, nTrain.sum, rmse_train])
-    .clip(trainAOI);
+      geometries:
+        false
 
-  var allBands = feature_city.bandNames();
-  var classNames = ['Tree', 'Grass', 'Other'];
-
-  var rfSamplesAll3Cls = addHardClassFromRatios(rfSamplesAll3);
-  rfSamplesAll3Cls = rfSamplesAll3Cls.filter(ee.Filter.gte('label_conf', 0.50));
-
-  var rfSamples = feature_train.sampleRegions({
-      collection: rfSamplesAll3Cls,
-      properties: ['cls', 'label_conf'],
-      scale: 10,
-      geometries: false
-    })
-    .filter(ee.Filter.neq(KEY_BAND, -9999))
-    .filter(ee.Filter.gt('UMXn_Tree', -0.5));
-
-  var rfMulti = ee.Classifier.smileRandomForest(200)
-    .setOutputMode('MULTIPROBABILITY')
-    .train({
-      features: rfSamples,
-      classProperty: 'cls',
-      inputProperties: allBands
     });
 
-  var probArr = feature_city.classify(rfMulti);
-  var probs1 = probArr.arrayFlatten([classNames]).float();
+  var grassLib =
+    fisherCity.sampleRegions({
 
-  var sumP = probs1.reduce(ee.Reducer.sum()).rename('sumP');
-  probs1 = probs1.divide(sumP).where(sumP.eq(0), 0).float();
+      collection:
+        pureGrass,
 
-  exportToDrive(probs1.select('Tree'), cityName + '_Tree', cityName + '_Tree', region);
-  exportToDrive(probs1.select('Grass'), cityName + '_Grass', cityName + '_Grass', region);
+      scale:
+        SCALE,
+
+      geometries:
+        false
+
+    });
+
+  var impLib =
+    fisherCity.sampleRegions({
+
+      collection:
+        pureImpervious,
+
+      scale:
+        SCALE,
+
+      geometries:
+        false
+
+    });
+
+  var soilLib =
+    fisherCity.sampleRegions({
+
+      collection:
+        pureSoil,
+
+      scale:
+        SCALE,
+
+      geometries:
+        false
+
+    });
+
+  var fisherModel =
+    buildFisherProjection(
+
+      treeLib,
+
+      grassLib,
+
+      impLib,
+
+      soilLib,
+
+      FISHER_BANDS
+
+    );
+
+  var F =
+    fisherModel.F;
+
+  treeLib =
+    addFisherCoordinates(
+      treeLib,
+      F,
+      FISHER_BANDS
+    );
+
+  grassLib =
+    addFisherCoordinates(
+      grassLib,
+      F,
+      FISHER_BANDS
+    );
+
+  impLib =
+    addFisherCoordinates(
+      impLib,
+      F,
+      FISHER_BANDS
+    );
+
+  soilLib =
+    addFisherCoordinates(
+      soilLib,
+      F,
+      FISHER_BANDS
+    );
+
+  var allPure =
+    treeLib
+      .merge(
+        grassLib
+      )
+      .merge(
+        impLib
+      )
+      .merge(
+        soilLib
+      );
+
+  var fisherStats =
+    fisherCoordinateStats(
+      allPure
+    );
+
+  treeLib =
+    addStandardizedFisher(
+      treeLib,
+      fisherStats
+    );
+
+  grassLib =
+    addStandardizedFisher(
+      grassLib,
+      fisherStats
+    );
+
+  impLib =
+    addStandardizedFisher(
+      impLib,
+      fisherStats
+    );
+
+  soilLib =
+    addStandardizedFisher(
+      soilLib,
+      fisherStats
+    );
+
+  var treePack =
+    packLibrary(
+      treeLib,
+      FISHER_BANDS
+    );
+
+  var grassPack =
+    packLibrary(
+      grassLib,
+      FISHER_BANDS
+    );
+
+  var impPack =
+    packLibrary(
+      impLib,
+      FISHER_BANDS
+    );
+
+  var soilPack =
+    packLibrary(
+      soilLib,
+      FISHER_BANDS
+    );
+
+  var mixedSpectral =
+    fisherTrain
+      .sampleRegions({
+
+        collection:
+          mixedPoints,
+
+        scale:
+          SCALE,
+
+        geometries:
+          true,
+
+        tileScale:
+          4
+
+      });
+
+  mixedSpectral =
+    addFisherCoordinates(
+
+      mixedSpectral,
+
+      F,
+
+      FISHER_BANDS
+
+    );
+
+  mixedSpectral =
+    addStandardizedFisher(
+
+      mixedSpectral,
+
+      fisherStats
+
+    );
+
+  var pseudoAll =
+    mixedSpectral.map(
+      function(f) {
+
+        return localizedPseudoLabel(
+
+          f,
+
+          treePack,
+
+          grassPack,
+
+          impPack,
+
+          soilPack,
+
+          F
+
+        );
+
+      }
+    );
+
+  var pseudoValid =
+    pseudoAll.filter(
+      ee.Filter.eq(
+        'pseudo_valid',
+        1
+      )
+    );
+
+  var validCount =
+    pseudoValid.size();
+
+  var percentileName =
+    'p' +
+    PSEUDO_KEEP_PERCENTILE;
+
+  var rmseThreshold =
+    ee.Number(
+      ee.Algorithms.If(
+
+        validCount.gt(0),
+
+        pseudoValid.reduceColumns({
+
+          reducer:
+            ee.Reducer.percentile([
+              PSEUDO_KEEP_PERCENTILE
+            ]),
+
+          selectors:
+            [
+              'Fisher_RMSE'
+            ]
+
+        })
+        .get(
+          percentileName
+        ),
+
+        1e30
+
+      )
+    );
+
+  var uncertaintyThreshold =
+    ee.Number(
+      ee.Algorithms.If(
+
+        validCount.gt(0),
+
+        pseudoValid.reduceColumns({
+
+          reducer:
+            ee.Reducer.percentile([
+              PSEUDO_KEEP_PERCENTILE
+            ]),
+
+          selectors:
+            [
+              'EndmemberUncertainty'
+            ]
+
+        })
+        .get(
+          percentileName
+        ),
+
+        1e30
+
+      )
+    );
+
+  var mixedSoft =
+    pseudoValid
+
+      .filter(
+        ee.Filter.lte(
+          'Fisher_RMSE',
+          rmseThreshold
+        )
+      )
+
+      .filter(
+        ee.Filter.lte(
+          'EndmemberUncertainty',
+          uncertaintyThreshold
+        )
+      );
+
+  var pureTreeLabels =
+    pureTree.map(
+      function(f) {
+
+        return f.set({
+
+          TreeRatio:
+            1,
+
+          GrassRatio:
+            0,
+
+          OtherRatio:
+            0,
+
+          sample_type:
+            'pure_tree'
+
+        });
+
+      }
+    );
+
+  var pureGrassLabels =
+    pureGrass.map(
+      function(f) {
+
+        return f.set({
+
+          TreeRatio:
+            0,
+
+          GrassRatio:
+            1,
+
+          OtherRatio:
+            0,
+
+          sample_type:
+            'pure_grass'
+
+        });
+
+      }
+    );
+
+  var pureImpLabels =
+    pureImpervious.map(
+      function(f) {
+
+        return f.set({
+
+          TreeRatio:
+            0,
+
+          GrassRatio:
+            0,
+
+          OtherRatio:
+            1,
+
+          sample_type:
+            'pure_impervious'
+
+        });
+
+      }
+    );
+
+  var pureSoilLabels =
+    pureSoil.map(
+      function(f) {
+
+        return f.set({
+
+          TreeRatio:
+            0,
+
+          GrassRatio:
+            0,
+
+          OtherRatio:
+            1,
+
+          sample_type:
+            'pure_soil'
+
+        });
+
+      }
+    );
+
+  var labeled =
+    pureTreeLabels
+
+      .merge(
+        pureGrassLabels
+      )
+
+      .merge(
+        pureImpLabels
+      )
+
+      .merge(
+        pureSoilLabels
+      )
+
+      .merge(
+        mixedSoft
+      )
+
+      .merge(
+        manualSamples
+      );
+
+  var training =
+    featureTrain
+      .sampleRegions({
+
+        collection:
+          labeled,
+
+        properties: [
+
+          'TreeRatio',
+          'GrassRatio',
+          'OtherRatio',
+          'sample_type'
+
+        ],
+
+        scale:
+          SCALE,
+
+        geometries:
+          false,
+
+        tileScale:
+          4
+
+      })
+
+      .filter(
+        ee.Filter.neq(
+          KEY_BAND,
+          -9999
+        )
+      );
+
+  /***************************************************************
+   * MODULE 8: RANDOM-FOREST REGRESSION
+   ***************************************************************/
+
+  var logTraining =
+    training.map(
+      function(f) {
+
+        var tree =
+          ee.Number(
+            f.get(
+              'TreeRatio'
+            )
+          )
+          .max(0)
+          .add(
+            LOGRATIO_EPS
+          );
+
+        var grass =
+          ee.Number(
+            f.get(
+              'GrassRatio'
+            )
+          )
+          .max(0)
+          .add(
+            LOGRATIO_EPS
+          );
+
+        var other =
+          ee.Number(
+            f.get(
+              'OtherRatio'
+            )
+          )
+          .max(0)
+          .add(
+            LOGRATIO_EPS
+          );
+
+        return f.set({
+
+          zTree:
+            tree
+              .divide(other)
+              .log(),
+
+          zGrass:
+            grass
+              .divide(other)
+              .log()
+
+        });
+
+      }
+    );
+
+  var rfTree =
+    ee.Classifier
+      .smileRandomForest({
+
+        numberOfTrees:
+          RF_TREES,
+
+        variablesPerSplit:
+          null,
+
+        minLeafPopulation:
+          1,
+
+        bagFraction:
+          0.7,
+
+        maxNodes:
+          null,
+
+        seed:
+          RF_SEED
+
+      })
+
+      .setOutputMode(
+        'REGRESSION'
+      )
+
+      .train({
+
+        features:
+          logTraining,
+
+        classProperty:
+          'zTree',
+
+        inputProperties:
+          allBands
+
+      });
+
+  var rfGrass =
+    ee.Classifier
+      .smileRandomForest({
+
+        numberOfTrees:
+          RF_TREES,
+
+        variablesPerSplit:
+          null,
+
+        minLeafPopulation:
+          1,
+
+        bagFraction:
+          0.7,
+
+        maxNodes:
+          null,
+
+        seed:
+          RF_SEED + 1
+
+      })
+
+      .setOutputMode(
+        'REGRESSION'
+      )
+
+      .train({
+
+        features:
+          logTraining,
+
+        classProperty:
+          'zGrass',
+
+        inputProperties:
+          allBands
+
+      });
+
+  var zTree =
+    featureCity
+
+      .classify(
+        rfTree
+      )
+
+      .rename(
+        'zTree'
+      )
+
+      .clamp(
+        -15,
+        15
+      );
+
+  var zGrass =
+    featureCity
+
+      .classify(
+        rfGrass
+      )
+
+      .rename(
+        'zGrass'
+      )
+
+      .clamp(
+        -15,
+        15
+      );
+
+  var rTree =
+    zTree.exp();
+
+  var rGrass =
+    zGrass.exp();
+
+  var rOther =
+    ee.Image.constant(1);
+
+  var denominator =
+    rTree
+
+      .add(
+        rGrass
+      )
+
+      .add(
+        rOther
+      );
+
+  var treeFraction =
+    rTree
+
+      .divide(
+        denominator
+      )
+
+      .rename(
+        'Tree'
+      )
+
+      .float();
+
+  var grassFraction =
+    rGrass
+
+      .divide(
+        denominator
+      )
+
+      .rename(
+        'Grass'
+      )
+
+      .float();
+
+  var otherFraction =
+    rOther
+
+      .divide(
+        denominator
+      )
+
+      .rename(
+        'Other'
+      )
+
+      .float();
+
+  var fractions =
+    ee.Image.cat([
+
+      treeFraction,
+
+      grassFraction,
+
+      otherFraction
+
+    ])
+    .clip(
+      region
+    );
+
+  var fractionSum =
+    fractions
+
+      .reduce(
+        ee.Reducer.sum()
+      )
+
+      .rename(
+        'FractionSum'
+      );
+
+  /***************************************************************
+   * MODULE 9: VISUALIZATION AND EXPORT
+   ***************************************************************/
+
+  Map.addLayer(
+
+    mixedSoft,
+
+    {
+      color:
+        'FFFF00'
+    },
+
+    'Reliable Local Fisher pseudo labels',
+
+    false
+
+  );
+
+  Map.addLayer(
+
+    treeFraction,
+
+    {
+
+      min:
+        0,
+
+      max:
+        1,
+
+      palette: [
+
+        'ffffff',
+
+        '006400'
+
+      ]
+
+    },
+
+    'Tree fractional cover'
+
+  );
+
+  Map.addLayer(
+
+    grassFraction,
+
+    {
+
+      min:
+        0,
+
+      max:
+        1,
+
+      palette: [
+
+        'ffffff',
+
+        '7CFC00'
+
+      ]
+
+    },
+
+    'Grass fractional cover'
+
+  );
+
+  Map.addLayer(
+
+    otherFraction,
+
+    {
+
+      min:
+        0,
+
+      max:
+        1,
+
+      palette: [
+
+        'ffffff',
+
+        '000000'
+
+      ]
+
+    },
+
+    'Other fractional cover'
+
+  );
+
+  Map.addLayer(
+
+    fractionSum,
+
+    {
+
+      min:
+        0.999,
+
+      max:
+        1.001
+
+    },
+
+    'Tree + Grass + Other',
+
+    false
+
+  );
+
+  var rgb =
+    ee.Image.cat([
+
+      otherFraction,
+
+      treeFraction,
+
+      grassFraction
+
+    ]);
+
+  Map.addLayer(
+
+    rgb,
+
+    {
+
+      min: [
+        0,
+        0,
+        0
+      ],
+
+      max: [
+        1,
+        1,
+        1
+      ]
+
+    },
+
+    cityName +
+      ' fractional-cover RGB'
+
+  );
+
+  function exportToDrive(
+    image,
+    description,
+    prefix
+  ) {
+
+    Export.image.toDrive({
+
+      image:
+        image
+          .clamp(
+            0,
+            1
+          )
+          .toFloat(),
+
+      description:
+        description,
+
+      folder:
+        DRIVE_FOLDER,
+
+      fileNamePrefix:
+        prefix,
+
+      region:
+        region,
+
+      scale:
+        SCALE,
+
+      maxPixels:
+        1e13,
+
+      fileFormat:
+        'GeoTIFF',
+
+      formatOptions: {
+
+        cloudOptimized:
+          true
+
+      }
+
+    });
+  }
+
+  exportToDrive(
+
+    treeFraction,
+
+    cityName +
+      '_' +
+      YEAR +
+      '_Tree_LocalFisherRF',
+
+    cityName +
+      '_' +
+      YEAR +
+      '_Tree_LocalFisherRF'
+
+  );
+
+  exportToDrive(
+
+    grassFraction,
+
+    cityName +
+      '_' +
+      YEAR +
+      '_Grass_LocalFisherRF',
+
+    cityName +
+      '_' +
+      YEAR +
+      '_Grass_LocalFisherRF'
+
+  );
+
+  exportToDrive(
+
+    otherFraction,
+
+    cityName +
+      '_' +
+      YEAR +
+      '_Other_LocalFisherRF',
+
+    cityName +
+      '_' +
+      YEAR +
+      '_Other_LocalFisherRF'
+
+  );
+
+  exportToDrive(
+
+    fractions,
+
+    cityName +
+      '_' +
+      YEAR +
+      '_TreeGrassOther_LocalFisherRF',
+
+    cityName +
+      '_' +
+      YEAR +
+      '_TreeGrassOther_LocalFisherRF'
+
+  );
+
 }
 
-/********************* UI控件 *********************/
-var CURRENT_CITY_NAME = null;
-var CURRENT_REGION = null;
+/***************************************************************
+ * MODULE 10: USER INTERFACE AND EXECUTION
+ ***************************************************************/
 
-var uiPanel = ui.Panel({
-  style: {width: '430px', position: 'top-left', padding: '8px'}
-});
+function runAllForUI(
+  region,
+  cityName
+) {
 
+  var masks =
+    buildPureAndMixedMasks(
+      region
+    );
 
+  var treePoints =
+    stratifiedPointsSafe(
 
-var citySelect = ui.Select({placeholder: '加载城市列表中…'});
-allCitiesFC.aggregate_array('city').distinct().sort().evaluate(function(list) {
-  citySelect.items().reset(list);
-  citySelect.setPlaceholder('选择城市');
-});
+      masks.tree,
 
-var yearBox = ui.Textbox({
-  placeholder: '年份（默认 ' + YEAR + '）',
-  value: ''
-});
+      1,
 
-var confirmBtn = ui.Button({
-  label: '✅ 确认城市',
-  style: {stretch: 'horizontal'}
-});
+      N_TREE,
 
-var runBtn = ui.Button({
-  label: '▶️ 运行整年分析',
-  style: {stretch: 'horizontal'}
-});
+      region,
 
-uiPanel.add(ui.Panel([ui.Label('城市'), citySelect], ui.Panel.Layout.flow('horizontal')));
-uiPanel.add(ui.Panel([ui.Label('年份'), yearBox], ui.Panel.Layout.flow('horizontal')));
-uiPanel.add(confirmBtn);
-uiPanel.add(runBtn);
-Map.add(uiPanel);
+      'Tree'
 
-confirmBtn.onClick(function() {
-  var cityName = citySelect.getValue();
-  if (!cityName) return;
+    );
 
-  var cityFC = allCitiesFC.filter(ee.Filter.eq('city', cityName));
-  var region = cityFC.union(1).geometry();
+  var grassPoints =
+    stratifiedPointsSafe(
 
-  Map.clear();
-  Map.add(uiPanel);
-  Map.centerObject(region, 10);
+      masks.grass,
 
-  CURRENT_CITY_NAME = cityName;
-  CURRENT_REGION = region;
+      2,
 
-  var yrTxt = yearBox.getValue();
-  YEAR = (yrTxt && yrTxt.trim() !== '') ? parseInt(yrTxt, 10) : YEAR;
-});
+      N_GRASS,
 
-runBtn.onClick(function() {
-  var cityName = CURRENT_CITY_NAME || citySelect.getValue();
-  if (!cityName) return;
+      region,
 
-  var region = CURRENT_REGION;
-  if (!region) {
-    var cityFC = allCitiesFC.filter(ee.Filter.eq('city', cityName));
-    region = cityFC.union(1).geometry();
-  }
+      'Grass'
 
-  var yrTxt = yearBox.getValue();
-  YEAR = (yrTxt && yrTxt.trim() !== '') ? parseInt(yrTxt, 10) : YEAR;
-  MONTHS = [1, 12];
+    );
 
-  Map.clear();
-  Map.add(uiPanel);
-  Map.centerObject(region, 10);
+  var imperviousPoints =
+    stratifiedPointsSafe(
 
-  runAllForUI(region, cityName);
-});
+      masks.impervious,
 
-/********************* UI 封装运行 *********************/
-function runAllForUI(region, cityName) {
-  var auto4 = buildAutoSamplesTGIS(region, cityName);
+      3,
 
-  var autoRF3 = auto4.map(function(f) {
-    return f.set({
-      TreeRatio: ee.Number(f.get('RF_TreeRatio')),
-      GrassRatio: ee.Number(f.get('RF_GrassRatio')),
-      OtherRatio: ee.Number(f.get('RF_OtherRatio'))
-    });
+      N_IMPERVIOUS,
+
+      region,
+
+      'Impervious'
+
+    );
+
+  var soilPoints =
+    stratifiedPointsSafe(
+
+      masks.soil,
+
+      4,
+
+      N_SOIL,
+
+      region,
+
+      'Soil'
+
+    );
+
+  var mixedPoints =
+    randomMixedPoints(
+
+      masks.mixed,
+
+      N_MIXED,
+
+      region
+
+    );
+
+  var manualLoad =
+    tryLoadManualSamples(
+      MANUAL_SHP_ASSET
+    );
+
+  var manualSamples =
+    ee.FeatureCollection(
+
+      ee.Algorithms.If(
+
+        manualLoad.has,
+
+        normalizeManualLabels(
+
+          manualLoad.fc
+            .filterBounds(
+              region
+            )
+
+        ),
+
+        ee.FeatureCollection([])
+
+      )
+    );
+
+  Map.addLayer(
+
+    treePoints,
+
+    {
+      color:
+        '006400'
+    },
+
+    'Pure Tree'
+
+  );
+
+  Map.addLayer(
+
+    grassPoints,
+
+    {
+      color:
+        '7CFC00'
+    },
+
+    'Pure Grass'
+
+  );
+
+  Map.addLayer(
+
+    imperviousPoints,
+
+    {
+      color:
+        '555555'
+    },
+
+    'Pure Impervious'
+
+  );
+
+  Map.addLayer(
+
+    soilPoints,
+
+    {
+      color:
+        '8B4513'
+    },
+
+    'Pure Soil'
+
+  );
+
+  Map.addLayer(
+
+    mixedPoints,
+
+    {
+      color:
+        'FFFF00'
+    },
+
+    'Mixed candidates'
+
+  );
+
+  Map.addLayer(
+
+    manualSamples,
+
+    {
+      color:
+        '00FFFF'
+    },
+
+    'Manual',
+
+    false
+
+  );
+
+  runAnalysis(
+
+    region,
+
+    cityName,
+
+    treePoints,
+
+    grassPoints,
+
+    imperviousPoints,
+
+    soilPoints,
+
+    mixedPoints,
+
+    manualSamples
+
+  );
+}
+
+var allCitiesFC =
+  ee.FeatureCollection(
+    ALL_CITIES_ASSET
+  );
+
+var CURRENT_CITY_NAME =
+  null;
+
+var CURRENT_REGION =
+  null;
+
+var uiPanel =
+  ui.Panel({
+
+    style: {
+
+      width:
+        '440px',
+
+      position:
+        'top-left',
+
+      padding:
+        '8px'
+
+    }
+
   });
 
-  var manualLoad = tryLoadManualSamples(MANUAL_SHP_ASSET);
-  var manualRF3 = ee.FeatureCollection([]);
+uiPanel.add(
 
-  if (manualLoad.has) {
-    manualRF3 = ensureRF3OneHot(manualLoad.fc).filterBounds(region);
+  ui.Label({
+
+    value:
+      'Localized Fisher-FCLS + Compositional RF',
+
+    style: {
+
+      fontWeight:
+        'bold',
+
+      fontSize:
+        '15px'
+
+    }
+
+  })
+
+);
+
+uiPanel.add(
+
+  ui.Label({
+
+    value:
+      'Tree / Grass / Other fractional cover'
+
+  })
+
+);
+
+var citySelect =
+  ui.Select({
+
+    placeholder:
+      'Loading city list...'
+
+  });
+
+allCitiesFC
+  .aggregate_array(
+    'city'
+  )
+  .distinct()
+  .sort()
+  .evaluate(
+
+    function(list) {
+
+      citySelect
+        .items()
+        .reset(
+          list
+        );
+
+      citySelect
+        .setPlaceholder(
+          'Select city'
+        );
+
+    }
+
+  );
+
+var yearBox =
+  ui.Textbox({
+
+    placeholder:
+      'Year, default ' +
+      YEAR,
+
+    value:
+      ''
+
+  });
+
+var confirmBtn =
+  ui.Button({
+
+    label:
+      'Show boundary',
+
+    style: {
+
+      stretch:
+        'horizontal'
+
+    }
+
+  });
+
+var runBtn =
+  ui.Button({
+
+    label:
+      'Run Local Fisher-FCLS + RF',
+
+    style: {
+
+      stretch:
+        'horizontal'
+
+    }
+
+  });
+
+uiPanel.add(
+
+  ui.Panel(
+
+    [
+
+      ui.Label(
+        'City'
+      ),
+
+      citySelect
+
+    ],
+
+    ui.Panel.Layout.flow(
+      'horizontal'
+    )
+
+  )
+
+);
+
+uiPanel.add(
+
+  ui.Panel(
+
+    [
+
+      ui.Label(
+        'Year'
+      ),
+
+      yearBox
+
+    ],
+
+    ui.Panel.Layout.flow(
+      'horizontal'
+    )
+
+  )
+
+);
+
+uiPanel.add(
+  confirmBtn
+);
+
+uiPanel.add(
+  runBtn
+);
+
+Map.add(
+  uiPanel
+);
+
+confirmBtn.onClick(
+
+  function() {
+
+    var cityName =
+      citySelect.getValue();
+
+    if (
+      !cityName
+    ) {
+
+      return;
+
+    }
+
+    var cityFC =
+      allCitiesFC.filter(
+
+        ee.Filter.eq(
+          'city',
+          cityName
+        )
+
+      );
+
+    var region =
+      cityFC
+        .union(1)
+        .geometry();
+
+    Map.clear();
+
+    Map.add(
+      uiPanel
+    );
+
+    Map.centerObject(
+      region,
+      10
+    );
+
+    Map.addLayer(
+
+      cityFC.style({
+
+        color:
+          'black',
+
+        fillColor:
+          '00000000',
+
+        width:
+          2
+
+      }),
+
+      {},
+
+      cityName +
+        ' boundary'
+
+    );
+
+    CURRENT_CITY_NAME =
+      cityName;
+
+    CURRENT_REGION =
+      region;
+
   }
 
-  var rfSamplesAll = ee.FeatureCollection(
-    ee.Algorithms.If(
-      manualLoad.has,
-      autoRF3.merge(manualRF3),
-      autoRF3
-    )
-  ).distinct(['.geo']);
+);
 
-  runAnalysis(region, cityName, auto4, rfSamplesAll, TRAIN_BUF);
-}
+runBtn.onClick(
+
+  function() {
+
+    var cityName =
+      CURRENT_CITY_NAME ||
+      citySelect.getValue();
+
+    if (
+      !cityName
+    ) {
+
+      return;
+
+    }
+
+    var cityFC =
+      allCitiesFC.filter(
+
+        ee.Filter.eq(
+          'city',
+          cityName
+        )
+
+      );
+
+    var region =
+      CURRENT_REGION ||
+      cityFC
+        .union(1)
+        .geometry();
+
+    var yr =
+      yearBox.getValue();
+
+    if (
+      yr &&
+      yr.trim() !== ''
+    ) {
+
+      YEAR =
+        parseInt(
+          yr,
+          10
+        );
+
+    }
+
+    MONTHS =
+      [
+        1,
+        12
+      ];
+
+    Map.clear();
+
+    Map.add(
+      uiPanel
+    );
+
+    Map.centerObject(
+      region,
+      10
+    );
+
+    Map.addLayer(
+
+      cityFC.style({
+
+        color:
+          'black',
+
+        fillColor:
+          '00000000',
+
+        width:
+          2
+
+      }),
+
+      {},
+
+      cityName +
+        ' boundary'
+
+    );
+
+    runAllForUI(
+
+      region,
+
+      cityName
+
+    );
+
+  }
+
+);
